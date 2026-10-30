@@ -31,7 +31,7 @@ hopsql install
 
 The installer asks you to choose a client and a connection source: direct database setup, an existing configuration file, or an optional DBeaver workspace. Direct setup accepts multiple instances, read-only settings and table rules. Credentials stay in a private configuration file or referenced environment variables; they are not placed in the client registration command. No Hopsql token is needed.
 
-It calls the selected client's own registration command and refuses to overwrite an existing Hopsql entry. Start a new client session, then ask it to list your database connections.
+It calls the selected client's own registration command. If a `hopsql` entry already exists, guided setup asks before replacing it; non-interactive setup needs `--replace` (Claude Code and Codex). Start a new client session, then ask it to list your database connections.
 
 ## Set up one client directly
 

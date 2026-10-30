@@ -103,7 +103,7 @@ hopsql install codex
 hopsql install opencode
 ```
 
-Registrations default to read-only. `install <client>` opens guided setup in a terminal. For noninteractive setup, provide `--config /path/to/connections.json`, or `--workspace /path/to/workspace --allow dev,analytics` for selected saved connections. Explicit config excludes workspace discovery. `--dry-run` previews registration; setup refuses to overwrite an existing entry or use symlink destinations.
+Registrations default to read-only. `install <client>` opens guided setup in a terminal. For noninteractive setup, provide `--config /path/to/connections.json`, or `--workspace /path/to/workspace --allow dev,analytics` for selected saved connections. Explicit config excludes workspace discovery. `--dry-run` previews registration. An existing `hopsql` entry is kept unless you confirm replacing it in guided setup or pass `--replace` (Claude Code and Codex; remove OpenCode entries manually). Setup never writes through symlinks.
 
 `--allow-writes` enables write tools. Direct JSON connections also need `readOnly: false`; imported connections retain their saved flag. Database grants and operator policy still apply. SSH requires a verified `known_hosts` entry by default; `HOPSQL_SSH_STRICT_HOST_KEY=false` explicitly allows unknown hosts for legacy setups.
 

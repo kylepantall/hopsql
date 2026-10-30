@@ -10,6 +10,9 @@ import {
   clientInvocation,
   installClient,
   selfLaunch,
+  hasClientEntry,
+  buildRemoveCommand,
+  ExistingEntryError,
 } from '../src/install.js';
 
 afterEach(() => vi.restoreAllMocks());
@@ -90,6 +93,45 @@ describe('MCP client registration', () => {
     expect(() => installClient(['claude', '--unknown'])).toThrow(/Supported install options/);
     expect(() => installClient(['unknown'])).toThrow(/Choose a client/);
     expect(spawnSync).not.toHaveBeenCalled();
+  });
+
+  it('replaces an existing entry only when asked, removing it before adding', () => {
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const home = fs.mkdtempSync(join(tmpdir(), 'hopsql-codex-'));
+    const config = join(home, 'config.toml');
+    fs.writeFileSync(config, '[mcp_servers.hopsql]\ncommand = "old"\n');
+    const saved = process.env.CODEX_HOME;
+    process.env.CODEX_HOME = home;
+    const environment = { HOPSQL_WORKSPACE: tmpdir(), HOPSQL_ALLOWED_CONNECTIONS: 'fixture' };
+    try {
+      spawnSync.mockReset();
+      expect(hasClientEntry('codex')).toBe(true);
+      expect(() => installClient(['codex'], environment)).toThrow(ExistingEntryError);
+      expect(spawnSync).not.toHaveBeenCalled();
+
+      // The fake client removes the entry the way the real CLI would.
+      spawnSync.mockImplementation((_command: string, args: string[]) => {
+        if (args.includes('remove')) fs.writeFileSync(config, '');
+        return { status: 0 } as never;
+      });
+      installClient(['codex', '--replace'], environment);
+      const calls = spawnSync.mock.calls.map(([, args]: [string, string[]]) => args.slice(0, 2));
+      expect(calls).toEqual([
+        ['mcp', 'remove'],
+        ['mcp', 'add'],
+      ]);
+    } finally {
+      if (saved === undefined) delete process.env.CODEX_HOME;
+      else process.env.CODEX_HOME = saved;
+      fs.rmSync(home, { recursive: true, force: true });
+      spawnSync.mockReset();
+    }
+  });
+
+  it('has no remove command for clients whose CLI cannot remove entries', () => {
+    expect(buildRemoveCommand('claude')?.args).toContain('remove');
+    expect(buildRemoveCommand('codex')?.args).toContain('remove');
+    expect(buildRemoveCommand('opencode')).toBeUndefined();
   });
 
   it('reports missing clients and failed registrations', () => {

@@ -5,6 +5,18 @@ set -euo pipefail
 # Bun. HOPSQL_SOURCE_DIR installs from a local checkout instead of downloading.
 HOPSQL_REPO="${HOPSQL_REPO:-kylepantall/hopsql}"
 
+step() { printf '\n==> %s\n' "$*"; }
+info() { printf '    %s\n' "$*"; }
+
+# Runs a noisy command quietly, showing its output only if it fails.
+quiet() {
+  local log="$HOPSQL_INSTALL_TEMP/step.log"
+  if ! "$@" >"$log" 2>&1; then
+    sed 's/^/    | /' "$log" >&2
+    return 1
+  fi
+}
+
 main() {
   local ref='main' register_claude=false force=false
   while (($#)); do
@@ -30,20 +42,41 @@ main() {
     return 1
   fi
   [[ -n "${HOME:-}" ]] || { printf 'HOME must be set.\n' >&2; return 1; }
+  local source_label="$HOPSQL_REPO@$ref"
+  [[ -z "${HOPSQL_SOURCE_DIR:-}" ]] || source_label="$HOPSQL_SOURCE_DIR"
+  printf 'Hopsql installer — %s\n' "$source_label"
+
+  HOPSQL_INSTALL_TEMP="$(mktemp -d)"
+  local temp_dir="$HOPSQL_INSTALL_TEMP"
+  trap 'rm -rf -- "$HOPSQL_INSTALL_TEMP"' EXIT
 
   # Check before building: replacing an entry drops its env, which can hold the
   # connection allowlist, so only do it when asked.
   local existing_entries=()
   if [[ "$register_claude" == true ]]; then
-    command -v claude >/dev/null 2>&1 || { printf 'claude CLI not found; skipping registration.\n' >&2; return 1; }
+    step 'Checking Claude Code registration'
+    command -v claude >/dev/null 2>&1 || { printf 'claude CLI not found; install without --claude, or install Claude Code first.\n' >&2; return 1; }
     for name in hopsql omnisql; do
-      if claude mcp get "$name" >/dev/null 2>&1; then existing_entries+=("$name"); fi
+      if claude mcp get "$name" >"$temp_dir/entry-$name" 2>&1; then
+        existing_entries+=("$name")
+        if [[ "$name" == omnisql ]]; then
+          info 'Found "omnisql": an entry from before the rename to Hopsql.'
+        else
+          info 'Found an existing "hopsql" entry.'
+        fi
+        grep -E '^ *(Scope|Command|Args|Environment|[A-Z][A-Z0-9_]+=)' "$temp_dir/entry-$name" | sed 's/=.*/=…/; s/^ */      /' || true
+      fi
     done
-    if ((${#existing_entries[@]})) && [[ "$force" != true ]]; then
-      printf 'Claude Code already has an MCP entry named: %s\n' "${existing_entries[*]}" >&2
-      printf 'Left unchanged. To replace it (its env is not kept), rerun with --claude --force,\n' >&2
-      printf 'or edit it with "claude mcp remove" and "claude mcp add".\n' >&2
-      return 1
+    if ((${#existing_entries[@]})); then
+      if [[ "$force" != true ]]; then
+        printf '\nStopped without changing anything. --force replaces %s with a fresh "hopsql" entry;\n' "${existing_entries[*]}" >&2
+        printf 'any environment shown above (connection allowlist, config file) is not carried over.\n' >&2
+        printf 'If that is fine, rerun with:\n  curl -fsSL https://raw.githubusercontent.com/%s/main/scripts/install.sh | bash -s -- --claude --force\n' "$HOPSQL_REPO" >&2
+        return 1
+      fi
+      info "--force: will replace ${existing_entries[*]} after a successful build."
+    else
+      info 'No existing entry.'
     fi
   fi
   local install_dir="${HOPSQL_INSTALL_DIR:-$HOME/.local/share/hopsql}"
@@ -52,14 +85,15 @@ main() {
   install_dir="$(cd "$install_dir" && pwd)"
   bin_dir="$(cd "$bin_dir" && pwd)"
 
-  HOPSQL_INSTALL_TEMP="$(mktemp -d)"
-  local temp_dir="$HOPSQL_INSTALL_TEMP"
-  trap 'rm -rf -- "$HOPSQL_INSTALL_TEMP"' EXIT
-
+  step 'Bun runtime'
   local bun_bin
   if command -v bun >/dev/null 2>&1 &&
     bun -e 'process.exit(Bun.semver.satisfies(Bun.version, ">=1.4.3") ? 0 : 1)' >/dev/null 2>&1; then
     bun_bin="$(command -v bun)"
+    info "Using $bun_bin ($("$bun_bin" --version))"
+  elif [[ -x "$install_dir/runtime/bun-1.4.3/bun" ]]; then
+    bun_bin="$install_dir/runtime/bun-1.4.3/bun"
+    info "Using private Bun 1.4.3 from a previous install"
   else
     command -v curl >/dev/null 2>&1 || { printf 'curl is required.\n' >&2; return 1; }
     command -v unzip >/dev/null 2>&1 || { printf 'unzip is required.\n' >&2; return 1; }
@@ -80,7 +114,7 @@ main() {
     fi
     local archive expected actual runtime_dir
     archive="bun-$platform-$arch.zip"
-    printf 'Installing a private Bun 1.4.3 runtime...\n'
+    info "Downloading a private Bun 1.4.3 ($archive) and verifying its checksum"
     curl -fsSL --connect-timeout 10 --max-time 120 --retry 2 --retry-delay 1 https://github.com/oven-sh/bun/releases/download/bun-v1.4.3/SHASUMS256.txt -o "$temp_dir/SHASUMS256.txt"
     expected="$(awk -v file="$archive" '$2 == file || $2 == ("*" file) {print $1; exit}' "$temp_dir/SHASUMS256.txt")"
     [[ "$expected" =~ ^[a-f0-9]{64}$ ]] || { printf 'Bun archive checksum not found.\n' >&2; return 1; }
@@ -101,6 +135,7 @@ main() {
     chmod +x "$runtime_dir/.bun-new"
     mv -f "$runtime_dir/.bun-new" "$runtime_dir/bun"
     bun_bin="$runtime_dir/bun"
+    info "Installed to $bun_bin"
   fi
 
   # Build into a fresh directory and swap it in, so a failed build leaves the
@@ -108,26 +143,33 @@ main() {
   local staging="$install_dir/app.new"
   rm -rf -- "$staging"
   mkdir -p "$staging"
+  step 'Fetching source'
   if [[ -n "${HOPSQL_SOURCE_DIR:-}" ]]; then
-    printf 'Copying %s...\n' "$HOPSQL_SOURCE_DIR"
+    info "Copying $HOPSQL_SOURCE_DIR"
     (cd "$HOPSQL_SOURCE_DIR" && git ls-files -z --cached --others --exclude-standard |
       xargs -0 tar -cf - --) | tar -xf - -C "$staging"
   else
     command -v curl >/dev/null 2>&1 || { printf 'curl is required.\n' >&2; return 1; }
-    printf 'Downloading %s@%s...\n' "$HOPSQL_REPO" "$ref"
+    info "Downloading github.com/$HOPSQL_REPO ($ref)"
     curl -fsSL --connect-timeout 10 --max-time 300 --retry 2 --retry-delay 1 \
       "https://codeload.github.com/$HOPSQL_REPO/tar.gz/$ref" -o "$temp_dir/source.tar.gz"
     tar -xzf "$temp_dir/source.tar.gz" -C "$staging" --strip-components 1
   fi
-  printf 'Building...\n'
+
+  step 'Installing dependencies'
   # --ignore-scripts skips the husky git hook, which needs a git checkout.
-  (cd "$staging" && "$bun_bin" install --frozen-lockfile --ignore-scripts >/dev/null &&
-    PATH="$(dirname "$bun_bin"):$PATH" "$bun_bin" scripts/build.mjs >/dev/null)
+  (cd "$staging" && quiet "$bun_bin" install --frozen-lockfile --ignore-scripts)
+  info 'Done'
+
+  step 'Building'
+  (cd "$staging" && PATH="$(dirname "$bun_bin"):$PATH" quiet "$bun_bin" scripts/build.mjs)
   rm -rf -- "$install_dir/app.old"
   [[ ! -d "$install_dir/app" ]] || mv "$install_dir/app" "$install_dir/app.old"
   mv "$staging" "$install_dir/app"
   rm -rf -- "$install_dir/app.old"
+  info "Built into $install_dir/app"
 
+  step 'Installing launcher'
   local launcher
   launcher="$(mktemp "$bin_dir/.hopsql.XXXXXX")"
   {
@@ -137,23 +179,30 @@ main() {
   } > "$launcher"
   chmod +x "$launcher"
   mv -f "$launcher" "$bin_dir/hopsql"
-  "$bin_dir/hopsql" --version
+  info "$bin_dir/hopsql (version $("$bin_dir/hopsql" --version 2>&1))"
 
   if [[ "$register_claude" == true ]]; then
+    step 'Registering with Claude Code'
     # ${a[@]+...} keeps bash 3.2 (macOS) happy with an empty array under set -u.
-    for name in ${existing_entries[@]+"${existing_entries[@]}"}; do claude mcp remove --scope user "$name" >/dev/null 2>&1 || true; done
-    if ! claude mcp add --transport stdio --scope user hopsql -- "$bin_dir/hopsql"; then
+    for name in ${existing_entries[@]+"${existing_entries[@]}"}; do
+      if claude mcp remove "$name" >/dev/null 2>&1; then
+        info "Removed \"$name\""
+      else
+        info "Could not remove \"$name\"; remove it with: claude mcp remove $name --scope <scope>"
+      fi
+    done
+    if ! quiet claude mcp add --transport stdio --scope user hopsql -- "$bin_dir/hopsql"; then
       printf 'Claude registration failed. Re-add it with:\n  claude mcp add --transport stdio --scope user hopsql -- %q\n' "$bin_dir/hopsql" >&2
       return 1
     fi
-    printf 'Registered with Claude Code. Start a new session to load it.\n'
+    info 'Added "hopsql" (user scope). Start a new Claude session to load it.'
   fi
 
-  printf '\nInstalled: %s/hopsql\n' "$bin_dir"
-  [[ "$register_claude" == true ]] || printf 'Register it with: %s/hopsql install claude\n' "$bin_dir"
+  printf '\n✓ Hopsql installed: %s/hopsql\n' "$bin_dir"
+  [[ "$register_claude" == true ]] || printf '  Register it with: %s/hopsql install claude\n' "$bin_dir"
   case ":$PATH:" in
     *":$bin_dir:"*) ;;
-    *) printf 'For terminal use, add this to your shell profile:\n  export PATH="%s:$PATH"\n' "$bin_dir" ;;
+    *) printf '  For terminal use, add this to your shell profile:\n    export PATH="%s:$PATH"\n' "$bin_dir" ;;
   esac
 }
 main "$@"

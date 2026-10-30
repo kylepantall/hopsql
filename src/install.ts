@@ -109,6 +109,61 @@ export function clientInvocation(command: string, args: string[], platform = pro
   };
 }
 
+/** Commands that remove an existing registration, where the client CLI has one. */
+export function buildRemoveCommand(
+  client: string
+): { command: string; args: string[] } | undefined {
+  if (client === 'claude')
+    return { command: 'claude', args: ['mcp', 'remove', 'hopsql', '--scope', 'user'] };
+  if (client === 'codex') return { command: 'codex', args: ['mcp', 'remove', 'hopsql'] };
+  return undefined;
+}
+
+function runClient(command: string, args: string[], stdio: 'inherit' | 'ignore' = 'inherit') {
+  const invocation = clientInvocation(command, args);
+  const result = spawnSync(invocation.command, invocation.args, {
+    stdio,
+    shell: false,
+    env: invocation.env,
+    windowsVerbatimArguments: process.platform === 'win32',
+  });
+  if (result.error) {
+    if ('code' in result.error && result.error.code === 'ENOENT') {
+      throw new Error(
+        `${command} is not installed or is not on PATH. Install the client first, then rerun this command.`
+      );
+    }
+    throw new Error(`${command} could not start. Check that the client is installed and on PATH.`);
+  }
+  return result;
+}
+
+/** Remove an existing registration so a replacement can be added under the same name. */
+function removeClientEntry(client: string): void {
+  const remove = buildRemoveCommand(client);
+  if (!remove)
+    throw new Error(
+      `Remove the existing hopsql entry from ${client}'s MCP settings, then run setup again.`
+    );
+  const result = runClient(remove.command, remove.args);
+  if (result.status !== 0)
+    throw new Error(
+      `${remove.command} could not remove the existing hopsql entry (exit ${result.status ?? result.signal}).`
+    );
+}
+
+export function hasClientEntry(client: string): boolean {
+  try {
+    assertClientDestination(client);
+    return false;
+  } catch (error) {
+    if (error instanceof ExistingEntryError) return true;
+    throw error;
+  }
+}
+
+export class ExistingEntryError extends Error {}
+
 function assertClientDestination(client: string): void {
   const home = homedir();
   const candidates =
@@ -142,8 +197,8 @@ function assertClientDestination(client: string): void {
           )
         : /"hopsql"\s*:/.test(content)
     )
-      throw new Error(
-        'An hopsql entry already exists. Keep it, or remove it with your client before running setup again.'
+      throw new ExistingEntryError(
+        'A hopsql entry already exists. Keep it, or replace it: rerun with --replace (or answer yes in guided setup).'
       );
   }
 }
@@ -155,11 +210,13 @@ export function installClient(args: string[], environment: Record<string, string
     throw new Error('Choose either --read-only or --allow-writes.');
   let readOnly = true;
   let dryRun = false;
+  let replace = false;
   for (let index = 0; index < flags.length; index++) {
     const flag = flags[index];
     if (flag === '--read-only') readOnly = true;
     else if (flag === '--allow-writes') readOnly = false;
     else if (flag === '--dry-run') dryRun = true;
+    else if (flag === '--replace') replace = true;
     else if (['--config', '--workspace', '--allow'].includes(flag)) {
       const value = flags[++index];
       if (!value || value.startsWith('--')) throw new Error(`${flag} requires a value.`);
@@ -170,7 +227,7 @@ export function installClient(args: string[], environment: Record<string, string
       } else settings.HOPSQL_ALLOWED_CONNECTIONS = value;
     } else
       throw new Error(
-        'Supported install options: --read-only, --allow-writes, --dry-run, --config <file>, --workspace <directory>, --allow <ids>'
+        'Supported install options: --read-only, --allow-writes, --dry-run, --replace, --config <file>, --workspace <directory>, --allow <ids>'
       );
   }
   if (settings.HOPSQL_CONFIG_FILE && settings.HOPSQL_WORKSPACE)
@@ -205,22 +262,12 @@ export function installClient(args: string[], environment: Record<string, string
     throw new Error('Workspace must be a directory.');
   console.error([command, ...commandArgs.map((value) => JSON.stringify(value))].join(' '));
   if (dryRun) return;
-  assertClientDestination(client);
-  const invocation = clientInvocation(command, commandArgs);
-  const result = spawnSync(invocation.command, invocation.args, {
-    stdio: 'inherit',
-    shell: false,
-    env: invocation.env,
-    windowsVerbatimArguments: process.platform === 'win32',
-  });
-  if (result.error) {
-    if ('code' in result.error && result.error.code === 'ENOENT') {
-      throw new Error(
-        `${command} is not installed or is not on PATH. Install the client first, then rerun this command.`
-      );
-    }
-    throw new Error(`${command} could not start. Check that the client is installed and on PATH.`);
+  if (replace && hasClientEntry(client)) {
+    removeClientEntry(client);
+    console.error('Removed the existing hopsql entry.');
   }
+  assertClientDestination(client);
+  const result = runClient(command, commandArgs);
   if (result.status !== 0) {
     throw new Error(
       `${command} could not add Hopsql (exit ${result.status ?? result.signal}). Check the client output above.`
@@ -307,7 +354,24 @@ export async function runInstall(args: string[]): Promise<void> {
         })),
       })
     );
-  assertClientDestination(client);
+  let replace = false;
+  if (hasClientEntry(client)) {
+    const label = clients.find((entry) => entry.value === client)?.label ?? client;
+    if (!buildRemoveCommand(client))
+      throw new Error(
+        `${label} already has a hopsql entry. Remove it from its MCP settings, then run setup again.`
+      );
+    replace = answer(
+      await confirm({
+        message: `${label} already has a hopsql entry. Replace it with the settings you choose next?`,
+        initialValue: false,
+      })
+    );
+    if (!replace) {
+      cancel('Kept the existing hopsql entry.');
+      return;
+    }
+  }
   const mode = answer(
     await select({
       message: 'How do you want to connect?',
@@ -408,7 +472,7 @@ export async function runInstall(args: string[]): Promise<void> {
       HOPSQL_READ_ONLY: String(readOnly),
     };
   }
-  installClient([client], environment);
+  installClient(replace ? [client, '--replace'] : [client], environment);
   outro('Ready. Start a new client session, then ask it to list your database connections.');
 }
 
