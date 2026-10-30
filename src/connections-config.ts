@@ -2,12 +2,13 @@ import type {
   AwsSecretConfig,
   ConnectionOverride,
   DatabaseConnection,
+  ManagedSettings,
   SsmConfig,
 } from './types.js';
 import { validateAccessRule } from './policy/access.js';
 import fs from 'node:fs';
 import { homedir } from 'node:os';
-import { dirname, join } from 'node:path';
+import { dirname, isAbsolute, join } from 'node:path';
 import { readPrivateFile } from './runtime/private-file.js';
 
 const KEYS = [
@@ -136,7 +137,8 @@ function readConfig(file: string): Record<string, unknown> {
   if (
     config.version !== 1 ||
     Object.keys(config).some(
-      (k) => !['version', 'defaults', 'connections', 'overrides'].includes(k)
+      (k) =>
+        !['version', 'defaults', 'connections', 'overrides', 'tools', 'dumpDirectory'].includes(k)
     )
   )
     throw new Error('Unsupported connection config version or setting');
@@ -185,32 +187,80 @@ export function loadManagedOverrides(
   return fs.existsSync(file) ? loadConnectionOverrides(file) : {};
 }
 
+function absolutePath(value: unknown, label: string): string {
+  if (typeof value !== 'string' || !isAbsolute(value) || /[\0\r\n]/.test(value))
+    throw new Error(`${label} must be an absolute path`);
+  return value;
+}
+
+/** Pinned dump clients and the dump folder from the managed file. */
+export function loadManagedSettings(file = managedOverridesPath()): ManagedSettings {
+  if (!fs.existsSync(file)) return {};
+  const config = readConfig(file);
+  const settings: ManagedSettings = {};
+  if (config.tools !== undefined) {
+    const tools = object(config.tools, 'tools');
+    if (Object.keys(tools).some((k) => k !== 'pgDump' && k !== 'mysqldump'))
+      throw new Error('Unknown setting in tools');
+    settings.tools = {};
+    if (tools.pgDump !== undefined)
+      settings.tools.pgDump = absolutePath(tools.pgDump, 'tools.pgDump');
+    if (tools.mysqldump !== undefined)
+      settings.tools.mysqldump = absolutePath(tools.mysqldump, 'tools.mysqldump');
+  }
+  if (config.dumpDirectory !== undefined)
+    settings.dumpDirectory = absolutePath(config.dumpDirectory, 'dumpDirectory');
+  return settings;
+}
+
 /**
- * Replace the managed overrides. Written to a private temp file and renamed,
- * so the server never reads a half-written file.
+ * Replace the managed file. Written to a private temp file, checked, then
+ * renamed, so the server never reads a half-written or invalid file.
  */
-export function saveManagedOverrides(
+function writeManagedFile(
   overrides: Record<string, ConnectionOverride>,
-  file = managedOverridesPath()
+  settings: ManagedSettings,
+  file: string
 ): void {
   const kept = Object.fromEntries(
     Object.entries(overrides).filter(([, value]) => Object.keys(value).length > 0)
   );
+  const tools = Object.fromEntries(
+    Object.entries(settings.tools ?? {}).filter(([, value]) => value)
+  );
+  const body = {
+    version: 1,
+    overrides: kept,
+    ...(Object.keys(tools).length ? { tools } : {}),
+    ...(settings.dumpDirectory ? { dumpDirectory: settings.dumpDirectory } : {}),
+  };
   fs.mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
   if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink())
     throw new Error('Managed overrides will not be written through a symlink');
   const temp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify({ version: 1, overrides: kept }, null, 2) + '\n', {
-    mode: 0o600,
-    flag: 'wx',
-  });
+  fs.writeFileSync(temp, JSON.stringify(body, null, 2) + '\n', { mode: 0o600, flag: 'wx' });
   try {
     loadConnectionOverrides(temp);
+    loadManagedSettings(temp);
     fs.renameSync(temp, file);
   } catch (error) {
     fs.rmSync(temp, { force: true });
     throw error;
   }
+}
+
+export function saveManagedOverrides(
+  overrides: Record<string, ConnectionOverride>,
+  file = managedOverridesPath()
+): void {
+  writeManagedFile(overrides, loadManagedSettings(file), file);
+}
+
+export function saveManagedSettings(
+  settings: ManagedSettings,
+  file = managedOverridesPath()
+): void {
+  writeManagedFile(loadManagedOverrides(file), settings, file);
 }
 
 /** Layer an override onto a connection; later settings win. */

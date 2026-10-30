@@ -1,7 +1,7 @@
-import { spawn } from 'node:child_process';
-import { constants, accessSync, realpathSync, statSync } from 'node:fs';
-import fs from 'node:fs/promises';
-import { devNull, tmpdir } from 'node:os';
+import { spawn, spawnSync } from 'node:child_process';
+import { constants, accessSync, readdirSync, realpathSync, statSync } from 'node:fs';
+import fs, { type FileHandle } from 'node:fs/promises';
+import { devNull, homedir, tmpdir } from 'node:os';
 import path from 'node:path';
 import type { Writable } from 'node:stream';
 import { readConnectionProp } from '../auth/connection-props.js';
@@ -13,6 +13,7 @@ import { sshTunnelManager } from '../net/ssh-tunnel.js';
 import { tableNameParts } from '../metadata/identifiers.js';
 import { sqlDialect } from '../policy/analyzer.js';
 import { sanitizeDiagnostic } from '../privacy.js';
+import { loadManagedSettings } from '../connections-config.js';
 import type {
   DatabaseConnection,
   DumpBinary,
@@ -66,9 +67,137 @@ function executable(file: string): boolean {
   }
 }
 
+function dumpNames(flavor: DumpFlavor): string[] {
+  return flavor === 'postgres'
+    ? ['pg_dump']
+    : flavor === 'mariadb'
+      ? ['mariadb-dump', 'mysqldump']
+      : ['mysqldump', 'mariadb-dump'];
+}
+
+/** Subdirectories of `parent` whose names match, each joined with `suffix`. */
+function versionedDirs(parent: string, pattern: RegExp, suffix: string[]): string[] {
+  try {
+    return readdirSync(parent)
+      .filter((name) => pattern.test(name))
+      .map((name) => path.join(parent, name, ...suffix));
+  } catch {
+    return [];
+  }
+}
+
 /**
- * Find the dump client: an explicit `HOPSQL_PG_DUMP_PATH` / `HOPSQL_MYSQLDUMP_PATH`
- * wins, otherwise PATH. MariaDB connections prefer `mariadb-dump`.
+ * Where client tools usually live but MCP clients' minimal PATH misses:
+ * Homebrew keg-only formulae, Postgres.app, and the Windows installers.
+ */
+export function commonDumpDirectories(platform = process.platform): string[] {
+  if (platform === 'win32') {
+    const roots = [process.env.ProgramFiles, process.env['ProgramFiles(x86)']].filter(
+      (root): root is string => !!root
+    );
+    return roots.flatMap((root) => [
+      ...versionedDirs(path.join(root, 'PostgreSQL'), /^\d+/, ['bin']),
+      ...versionedDirs(root, /^MariaDB/i, ['bin']),
+      ...versionedDirs(path.join(root, 'MySQL'), /^MySQL/i, ['bin']),
+    ]);
+  }
+  const brew = ['/opt/homebrew/opt', '/usr/local/opt'];
+  return [
+    ...brew.flatMap((root) =>
+      versionedDirs(root, /^(libpq|postgresql(@\d+)?|mysql-client(@[\d.]+)?|mariadb(@[\d.]+)?)$/, [
+        'bin',
+      ])
+    ),
+    ...versionedDirs('/Applications/Postgres.app/Contents/Versions', /^\d+|^latest$/, ['bin']),
+    ...versionedDirs('/usr/lib/postgresql', /^\d+$/, ['bin']),
+    '/opt/homebrew/bin',
+    '/usr/local/bin',
+    '/usr/bin',
+  ];
+}
+
+const versions = new Map<string, number[] | null>();
+
+/** `--version` as numbers (e.g. [17, 2]), cached per binary; null if it will not say. */
+export function dumpToolVersion(file: string): number[] | null {
+  if (versions.has(file)) return versions.get(file)!;
+  let version: number[] | null = null;
+  try {
+    const result = spawnSync(file, ['--version'], {
+      encoding: 'utf8',
+      timeout: 5000,
+      shell: false,
+      windowsHide: true,
+    });
+    // mysqldump prints "Ver 8.0.36" or "Distrib 10.11.6-MariaDB"; take the last.
+    const matches = [...String(result.stdout ?? '').matchAll(/(\d+)\.(\d+)(?:\.(\d+))?/g)];
+    const last = matches.at(-1);
+    if (last) version = last.slice(1).filter(Boolean).map(Number);
+  } catch {
+    // Unrunnable: reported as unknown.
+  }
+  versions.set(file, version);
+  return version;
+}
+
+function compareVersions(a: number[] | null, b: number[] | null): number {
+  for (let i = 0; i < 3; i++) {
+    const diff = (b?.[i] ?? -1) - (a?.[i] ?? -1);
+    if (diff) return diff;
+  }
+  return 0;
+}
+
+export interface DumpCandidate {
+  path: string;
+  name: string;
+  version: number[] | null;
+}
+
+/**
+ * Every installed client for a flavor, best first: by name preference
+ * (`mariadb-dump` for MariaDB), then newest - a newer pg_dump can dump older
+ * servers, never the reverse.
+ */
+export function findDumpCandidates(
+  flavor: DumpFlavor,
+  env: NodeJS.ProcessEnv = process.env,
+  platform = process.platform,
+  extraDirs: string[] = env === process.env ? commonDumpDirectories(platform) : []
+): DumpCandidate[] {
+  const names = dumpNames(flavor);
+  const extensions = platform === 'win32' ? ['.exe', '.cmd', '.bat'] : [''];
+  const directories = [
+    ...(env.PATH ?? env.Path ?? '').split(platform === 'win32' ? ';' : path.delimiter),
+    ...extraDirs,
+  ].filter((dir) => dir && path.isAbsolute(dir));
+  const seen = new Set<string>();
+  const found: DumpCandidate[] = [];
+  for (const dir of directories)
+    for (const name of names)
+      for (const ext of extensions) {
+        const file = path.join(dir, name + ext);
+        if (!executable(file)) continue;
+        let real = file;
+        try {
+          real = realpathSync(file);
+        } catch {
+          // Unresolvable links still count by their own path.
+        }
+        if (seen.has(real)) continue;
+        seen.add(real);
+        found.push({ path: file, name, version: dumpToolVersion(file) });
+      }
+  return found.sort(
+    (a, b) => names.indexOf(a.name) - names.indexOf(b.name) || compareVersions(a.version, b.version)
+  );
+}
+
+/**
+ * Find the dump client: `HOPSQL_PG_DUMP_PATH` / `HOPSQL_MYSQLDUMP_PATH` wins,
+ * then a client pinned in `hopsql manage`, then the best installed one.
+ * A caller passing its own `env` gets exactly that env, without the machine's
+ * pinned tools or install folders.
  */
 export function resolveDumpBinary(
   flavor: DumpFlavor,
@@ -76,23 +205,17 @@ export function resolveDumpBinary(
   platform = process.platform
 ): DumpBinary {
   const variable = flavor === 'postgres' ? 'HOPSQL_PG_DUMP_PATH' : 'HOPSQL_MYSQLDUMP_PATH';
-  const override = env[variable]?.trim();
-  const names =
-    flavor === 'postgres'
-      ? ['pg_dump']
-      : flavor === 'mariadb'
-        ? ['mariadb-dump', 'mysqldump']
-        : ['mysqldump', 'mariadb-dump'];
-  const extensions = platform === 'win32' ? ['.exe', '.cmd', '.bat'] : [''];
-  const directories = (env.PATH ?? env.Path ?? '')
-    .split(platform === 'win32' ? ';' : path.delimiter)
-    .filter((dir) => dir && path.isAbsolute(dir));
-  const candidates = override
-    ? [override]
-    : names.flatMap((name) =>
-        directories.flatMap((dir) => extensions.map((ext) => path.join(dir, name + ext)))
-      );
-  const found = candidates.find(executable);
+  const names = dumpNames(flavor);
+  const pinned =
+    env === process.env
+      ? loadManagedSettings().tools?.[flavor === 'postgres' ? 'pgDump' : 'mysqldump']
+      : undefined;
+  const override = env[variable]?.trim() || pinned;
+  const found = override
+    ? executable(override)
+      ? override
+      : undefined
+    : findDumpCandidates(flavor, env, platform)[0]?.path;
   if (!found)
     throw new DumpError(
       'DUMP_TOOL_MISSING',
@@ -113,6 +236,47 @@ export function resolveDumpBinary(
         ? 'mariadb'
         : 'mysql';
   return { path: found, flavor: resolved };
+}
+
+/** Where `saveToFile` dumps go: the folder set in `hopsql manage`, else ~/hopsql-dumps. */
+export function dumpDirectory(): string {
+  return (
+    process.env.HOPSQL_DUMP_DIR ||
+    loadManagedSettings().dumpDirectory ||
+    path.join(homedir(), 'hopsql-dumps')
+  );
+}
+
+/**
+ * A new private file in the dump folder. Only a plain file name is accepted,
+ * so a requested name can never leave the folder or replace a file.
+ */
+export async function createDumpFile(
+  name: string,
+  directory = dumpDirectory()
+): Promise<{ path: string; handle: FileHandle }> {
+  if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$/.test(name) || name.includes('..'))
+    throw new DumpError(
+      'DUMP_INVALID_OPTIONS',
+      'fileName must be a plain file name (letters, digits, dot, dash, underscore)',
+      { field: 'fileName' }
+    );
+  await fs.mkdir(directory, { recursive: true, mode: 0o700 });
+  const file = path.join(directory, name);
+  try {
+    const handle = await fs.open(
+      file,
+      constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY | (constants.O_NOFOLLOW ?? 0),
+      0o600
+    );
+    return { path: file, handle };
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'EEXIST')
+      throw new DumpError('DUMP_INVALID_OPTIONS', 'A dump with that file name already exists', {
+        field: 'fileName',
+      });
+    throw error;
+  }
 }
 
 const BASE_ENV = [

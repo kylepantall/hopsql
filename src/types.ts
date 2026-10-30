@@ -365,7 +365,16 @@ export interface ExportSettings {
   /** Total bytes the private artifact store may hold. */
   artifactQuotaBytes: number;
   export: ExportLimits;
-  dump: { maxBytes: number; timeoutMs: number };
+  /** `fileMaxBytes` caps a dump saved straight to the dump folder. */
+  dump: { maxBytes: number; timeoutMs: number; fileMaxBytes: number };
+}
+
+/** Machine-wide settings `hopsql manage` keeps beside the connection overrides. */
+export interface ManagedSettings {
+  /** Absolute paths of pinned dump clients. */
+  tools?: { pgDump?: string; mysqldump?: string };
+  /** Where `saveToFile` dumps are written. */
+  dumpDirectory?: string;
 }
 
 /** Where and as whom a dump client connects; secrets never reach argv. */

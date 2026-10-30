@@ -77,6 +77,14 @@ export function exportSettings(env: NodeJS.ProcessEnv = process.env): ExportSett
     },
     dump: {
       maxBytes: bytes('HOPSQL_DUMP_MAX_BYTES', 32 * MIB),
+      // Saved files skip the artifact store, so its quota does not apply.
+      fileMaxBytes: integerSetting(
+        env.HOPSQL_DUMP_FILE_MAX_BYTES,
+        'HOPSQL_DUMP_FILE_MAX_BYTES',
+        8 * 1024 * MIB,
+        1024,
+        1024 * 1024 * MIB
+      ),
       timeoutMs: integerSetting(
         env.HOPSQL_DUMP_TIMEOUT_MS,
         'HOPSQL_DUMP_TIMEOUT_MS',

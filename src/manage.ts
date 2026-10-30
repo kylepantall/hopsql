@@ -10,14 +10,18 @@ import { homedir } from 'node:os';
 import { join } from 'node:path';
 import { cancel, intro, isCancel, log, note, outro, select, text } from '@clack/prompts';
 import { WorkspaceConfigParser, findWorkspaces } from './config-parser.js';
+import { isAbsolute } from 'node:path';
 import {
   loadManagedOverrides,
+  loadManagedSettings,
   managedOverridesPath,
   parseAwsSecret,
   parseSsm,
   saveManagedOverrides,
+  saveManagedSettings,
 } from './connections-config.js';
-import type { ConnectionOverride, DatabaseConnection, SsmConfig } from './types.js';
+import { dumpDirectory, findDumpCandidates, type DumpCandidate } from './runtime/dump.js';
+import type { ConnectionOverride, DatabaseConnection, DumpFlavor, SsmConfig } from './types.js';
 
 function answer<T>(value: T | symbol): T {
   if (isCancel(value)) {
@@ -177,6 +181,95 @@ async function promptSsm(
   };
 }
 
+const TOOLS: { key: 'pgDump' | 'mysqldump'; flavor: DumpFlavor; label: string }[] = [
+  { key: 'pgDump', flavor: 'postgres', label: 'PostgreSQL (pg_dump)' },
+  { key: 'mysqldump', flavor: 'mariadb', label: 'MySQL / MariaDB (mariadb-dump, mysqldump)' },
+];
+
+function describeCandidate(candidate: DumpCandidate): string {
+  return `${candidate.name} ${candidate.version?.join('.') ?? '(unknown version)'}`;
+}
+
+/**
+ * Pin the dump clients the MCP dump tools use, and the folder saved dumps go
+ * to. Unpinned, the server picks the newest installed client itself.
+ */
+async function manageDumpTools(): Promise<void> {
+  for (;;) {
+    const settings = loadManagedSettings();
+    const options = TOOLS.map(({ key, flavor, label }) => {
+      const pinned = settings.tools?.[key];
+      const best = findDumpCandidates(flavor)[0];
+      const state = pinned
+        ? `pinned: ${pinned}`
+        : best
+          ? `automatic: ${describeCandidate(best)} at ${best.path}`
+          : 'not found';
+      return { value: key, label, hint: state };
+    });
+    const choice = answer(
+      await select({
+        message: 'Dump tools',
+        options: [
+          ...options,
+          { value: 'folder', label: 'Dump folder', hint: dumpDirectory() },
+          { value: '', label: 'Back' },
+        ],
+      })
+    );
+    if (!choice) return;
+    if (choice === 'folder') {
+      const folder = answer(
+        await text({
+          message: 'Folder for dumps saved with saveToFile',
+          initialValue: dumpDirectory(),
+          validate: (value) =>
+            value && isAbsolute(value.trim().replace(/^~(?=$|\/)/, homedir()))
+              ? undefined
+              : 'Enter an absolute path',
+        })
+      )
+        .trim()
+        .replace(/^~(?=$|\/)/, homedir());
+      saveManagedSettings({ ...settings, dumpDirectory: folder });
+      log.success(`Dumps will be saved to ${folder}`);
+      continue;
+    }
+    const tool = TOOLS.find((t) => t.key === choice)!;
+    const candidates = findDumpCandidates(tool.flavor);
+    const picked = answer(
+      await select({
+        message: tool.label,
+        initialValue: settings.tools?.[tool.key] ?? '',
+        options: [
+          { value: '', label: 'Automatic', hint: 'newest installed, found by the server' },
+          ...candidates.map((c) => ({ value: c.path, label: describeCandidate(c), hint: c.path })),
+          { value: '\0other', label: 'Another path…' },
+        ],
+      })
+    );
+    let path = picked;
+    if (picked === '\0other')
+      path = answer(
+        await text({
+          message: `Path to ${tool.flavor === 'postgres' ? 'pg_dump' : 'mariadb-dump or mysqldump'}`,
+          validate: (value) => {
+            const file = value?.trim() ?? '';
+            if (!isAbsolute(file)) return 'Enter an absolute path';
+            try {
+              return fs.statSync(file).isFile() ? undefined : 'Not a file';
+            } catch {
+              return 'File not found';
+            }
+          },
+        })
+      ).trim();
+    const tools = { ...settings.tools, [tool.key]: path || undefined };
+    saveManagedSettings({ ...settings, tools });
+    log.success(path ? `${tool.label}: using ${path}` : `${tool.label}: automatic`);
+  }
+}
+
 export async function runManage(): Promise<void> {
   intro('Hopsql connections');
   const file = managedOverridesPath();
@@ -189,20 +282,23 @@ export async function runManage(): Promise<void> {
       outro('Fix the configuration above, then run hopsql again.');
       return;
     }
-    if (!connections.length) {
-      outro('No connections found. Save one in DBeaver, or run hopsql install.');
-      return;
-    }
+    if (!connections.length)
+      log.warn('No connections found. Save one in DBeaver, or run hopsql install.');
     const chosen = answer(
       await select({
         message: 'Choose a connection',
         options: [
           ...connections.map((c) => ({ value: c.id, label: describeConnection(c) })),
+          { value: '\0tools', label: 'Dump tools and folder' },
           { value: '', label: 'Done' },
         ],
       })
     );
     if (!chosen) break;
+    if (chosen === '\0tools') {
+      await manageDumpTools();
+      continue;
+    }
     const connection = connections.find((c) => c.id === chosen)!;
     const overrides = loadManagedOverrides(file);
     const existing = overrides[connection.id] ?? {};

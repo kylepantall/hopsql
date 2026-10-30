@@ -14,6 +14,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `awsSecret`: read `username` / `password` from AWS Secrets Manager.
 - `hopsql manage` (or bare `hopsql` in a terminal): per-connection read-only switch and AWS SSM / Secrets Manager setup, saved to `~/.config/hopsql/overrides.json`. Overrides also accept `readOnly`.
 - Unknown SSH host keys can be approved from the MCP client's prompt.
+- Dump tools: `saveToFile` / `fileName` write the dump straight to the dump folder (`~/hopsql-dumps`, up to `HOPSQL_DUMP_FILE_MAX_BYTES`) and return its path.
+- Dump clients are found in Homebrew, Postgres.app and Program Files folders as well as PATH, newest first; `hopsql manage` can pin one and set the dump folder.
 
 ### Changed
 

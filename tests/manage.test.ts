@@ -9,14 +9,18 @@ mock.module('@clack/prompts', () => ({
   outro: vi.fn(),
   note: vi.fn(),
   cancel: vi.fn(),
-  log: { step: vi.fn(), success: vi.fn(), message: vi.fn(), error: vi.fn() },
+  log: { step: vi.fn(), success: vi.fn(), message: vi.fn(), error: vi.fn(), warn: vi.fn() },
   select: prompt,
   text: prompt,
   isCancel: (value: unknown) => typeof value === 'symbol',
 }));
 import { awsProfiles, runManage } from '../src/manage.js';
 import { WorkspaceConfigParser } from '../src/config-parser.js';
-import { loadManagedOverrides, saveManagedOverrides } from '../src/connections-config.js';
+import {
+  loadManagedOverrides,
+  loadManagedSettings,
+  saveManagedOverrides,
+} from '../src/connections-config.js';
 import { setEnv, restoreEnv } from './support/environment.js';
 
 const dirs: string[] = [];
@@ -124,6 +128,16 @@ describe('hopsql manage', () => {
     expect((await parse()).readonly).toBe(true);
     saveManagedOverrides({ 'pg-1': { readOnly: false } }, overrides);
     expect((await parse()).readonly).toBe(false);
+  });
+
+  it('sets the dump folder without losing connection overrides', async () => {
+    const { dir, overrides } = fixture();
+    const folder = path.join(dir, 'dumps');
+    answers.push('pg-1', 'readOnly', '\0tools', 'folder', folder, '', '');
+    await runManage();
+    expect(answers).toHaveLength(0);
+    expect(loadManagedSettings(overrides).dumpDirectory).toBe(folder);
+    expect(loadManagedOverrides(overrides)['pg-1']).toEqual({ readOnly: true });
   });
 
   it('lists AWS profiles from config and credentials, skipping sso-session blocks', () => {

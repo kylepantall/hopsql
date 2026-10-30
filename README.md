@@ -153,8 +153,15 @@ Run `hopsql` (or `hopsql manage`) in a terminal to pick a connection and:
 | Make read-only / Allow writes | Per-connection write switch |
 | Set up an AWS SSM hop | Bastion by Name tag or instance ID, remote host/port, optional Secrets Manager login |
 | Remove the AWS SSM hop | Back to the connection's own settings |
+| Dump tools and folder | Shows the `pg_dump` / `mariadb-dump` / `mysqldump` the server will use (with versions), lets you pin one, and sets where saved dumps go |
 
 Changes are saved to `~/.config/hopsql/overrides.json` (`HOPSQL_OVERRIDES_FILE` to move it) and apply on the next query; no re-registration. They win over `overrides` in `HOPSQL_CONFIG_FILE`. `HOPSQL_READ_ONLY=true` still makes every connection read-only. MCP clients start Hopsql with piped stdio, so they still get the server; `hopsql serve` forces it in a terminal.
+
+### Dumps
+
+`dump_table` / `dump_database` find the dump client themselves: `HOPSQL_PG_DUMP_PATH` / `HOPSQL_MYSQLDUMP_PATH`, then a client pinned in `hopsql manage`, then the newest one on PATH or in the usual install folders (Homebrew `libpq`/`postgresql@N`/`mysql-client`/`mariadb`, Postgres.app, Program Files). A newer `pg_dump` can dump older servers, never the reverse.
+
+Pass `saveToFile: true` to write the dump to a new owner-only file in the dump folder (default `~/hopsql-dumps`; `HOPSQL_DUMP_DIR` or `hopsql manage` to change) and get its path back, instead of a `read_export` handle. `fileName` picks the name; existing files are never replaced. Saved dumps are capped by `HOPSQL_DUMP_FILE_MAX_BYTES` (default 8 GiB), not the 32 MiB artifact limit.
 
 ## One server, many instances
 

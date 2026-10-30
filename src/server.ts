@@ -27,6 +27,8 @@ import {
   buildDumpCommand,
   dumpFlavorFor,
   resolveDumpBinary,
+  createDumpFile,
+  dumpDirectory,
   resolveDumpTarget,
   runDump,
 } from './runtime/dump.js';
@@ -81,6 +83,7 @@ import { TransactionManager } from './managers/index.js';
 import { buildExplainQuery, parseExplainOutput } from './utils/query-analyzer.js';
 import { compareSchemas, comparableSchema, generateMigrationScript } from './utils/schema-diff.js';
 import fs from 'fs';
+import { finished } from 'node:stream/promises';
 import path from 'path';
 import { fileURLToPath } from 'url';
 
@@ -735,43 +738,53 @@ export class HopsqlMCPServer {
           required: ['connectionId', 'query'],
         },
       },
-      ...(['dump_table', 'dump_database'] as const).map(
-        (name): Tool => ({
-          name,
-          description:
-            name === 'dump_table'
-              ? 'Dump table DDL and/or data as SQL with pg_dump or mysqldump/mariadb-dump; returns a read_export handle'
-              : 'Dump a whole database (or an include list of tables) as SQL with pg_dump or mysqldump/mariadb-dump; returns a read_export handle',
-          inputSchema: {
-            type: 'object',
-            properties: {
-              connectionId: {
-                type: 'string',
-                description: 'The ID or name of a PostgreSQL or MySQL/MariaDB connection',
-              },
-              tables: {
-                type: 'array',
-                items: { type: 'string', minLength: 1, maxLength: 1024 },
-                ...(name === 'dump_table' ? { minItems: 1 } : {}),
-                maxItems: 100,
-                description:
-                  name === 'dump_table'
-                    ? 'Tables to dump (schema.table on PostgreSQL)'
-                    : 'Optional include list; omitted dumps every table',
-              },
-              schemaOnly: { type: 'boolean', default: false, description: 'DDL only, no rows' },
-              dataOnly: { type: 'boolean', default: false, description: 'Rows only, no DDL' },
-              compression: {
-                type: 'string',
-                enum: ['none', 'gzip', 'brotli', 'zstd'],
-                default: 'none',
-                description: 'Optional download compression applied while the dump streams',
-              },
+      ...(['dump_table', 'dump_database'] as const).map((name): Tool => ({
+        name,
+        description:
+          name === 'dump_table'
+            ? 'Dump table DDL and/or data as SQL with pg_dump or mysqldump/mariadb-dump; returns a read_export handle'
+            : 'Dump a whole database (or an include list of tables) as SQL with pg_dump or mysqldump/mariadb-dump; returns a read_export handle',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            connectionId: {
+              type: 'string',
+              description: 'The ID or name of a PostgreSQL or MySQL/MariaDB connection',
             },
-            required: name === 'dump_table' ? ['connectionId', 'tables'] : ['connectionId'],
+            tables: {
+              type: 'array',
+              items: { type: 'string', minLength: 1, maxLength: 1024 },
+              ...(name === 'dump_table' ? { minItems: 1 } : {}),
+              maxItems: 100,
+              description:
+                name === 'dump_table'
+                  ? 'Tables to dump (schema.table on PostgreSQL)'
+                  : 'Optional include list; omitted dumps every table',
+            },
+            schemaOnly: { type: 'boolean', default: false, description: 'DDL only, no rows' },
+            dataOnly: { type: 'boolean', default: false, description: 'Rows only, no DDL' },
+            compression: {
+              type: 'string',
+              enum: ['none', 'gzip', 'brotli', 'zstd'],
+              default: 'none',
+              description: 'Optional download compression applied while the dump streams',
+            },
+            saveToFile: {
+              type: 'boolean',
+              default: false,
+              description:
+                "Write the dump to a new file in the user's dump folder and return its path, instead of a read_export handle; use for large dumps",
+            },
+            fileName: {
+              type: 'string',
+              pattern: '^[A-Za-z0-9][A-Za-z0-9._-]{0,200}$',
+              description:
+                'With saveToFile: plain file name to create (default: <connection>-<timestamp>.sql)',
+            },
           },
-        })
-      ),
+          required: name === 'dump_table' ? ['connectionId', 'tables'] : ['connectionId'],
+        },
+      })),
       {
         name: 'test_connection',
         description: 'Test connectivity to a database connection',
@@ -1267,6 +1280,8 @@ export class HopsqlMCPServer {
                 connectionId: string;
                 database?: string;
                 compression?: ExportCompression;
+                saveToFile?: boolean;
+                fileName?: string;
               }
             );
 
@@ -1549,13 +1564,11 @@ export class HopsqlMCPServer {
       throw new McpError(ErrorCode.InvalidParams, 'Use execute_query for SELECT operations');
     }
 
-    if (
-      !(
-        lowerQuery.startsWith('insert') ||
-        lowerQuery.startsWith('update') ||
-        lowerQuery.startsWith('delete')
-      )
-    ) {
+    if (!(
+      lowerQuery.startsWith('insert') ||
+      lowerQuery.startsWith('update') ||
+      lowerQuery.startsWith('delete')
+    )) {
       throw new McpError(
         ErrorCode.InvalidParams,
         'Only INSERT, UPDATE, or DELETE operations are allowed with write_query'
@@ -2021,6 +2034,8 @@ export class HopsqlMCPServer {
       connectionId: string;
       database?: string;
       compression?: ExportCompression;
+      saveToFile?: boolean;
+      fileName?: string;
     }
   ) {
     const connectionId = sanitizeConnectionId(args.connectionId);
@@ -2057,6 +2072,11 @@ export class HopsqlMCPServer {
       );
       const compression = args.compression ?? 'none';
       const limits = connectionStreamLimits(this.exportSettings.dump, connection);
+      if (args.saveToFile) return await this.dumpToFile(connection, command, binary, args, limits);
+      if (args.fileName)
+        throw new DumpError('DUMP_INVALID_OPTIONS', 'fileName needs saveToFile', {
+          field: 'fileName',
+        });
       const { stored, value } = await this.artifacts.exportStream(
         'sql' + compressionExtension[compression],
         this.catalogSource(connection),
@@ -2095,6 +2115,62 @@ export class HopsqlMCPServer {
         structuredContent: payload,
       };
     }
+  }
+
+  /**
+   * Stream a dump straight into a new file in the dump folder. It skips the
+   * artifact store, so the larger file cap applies; a failure removes the file.
+   */
+  private async dumpToFile(
+    connection: DatabaseConnection,
+    command: ReturnType<typeof buildDumpCommand>,
+    binary: ReturnType<typeof resolveDumpBinary>,
+    args: DumpOptions & { compression?: ExportCompression; fileName?: string },
+    limits: { timeoutMs: number }
+  ) {
+    const compression = args.compression ?? 'none';
+    const slug =
+      connection.name
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, '-')
+        .replace(/^-+|-+$/g, '')
+        .slice(0, 60) || 'dump';
+    const stamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..*$/, '');
+    const name = args.fileName ?? `${slug}-${stamp}.sql${compressionExtension[compression]}`;
+    const { path: file, handle } = await createDumpFile(name, dumpDirectory());
+    const output = handle.createWriteStream();
+    let value: { bytes: number };
+    try {
+      value = await withCompression(output, compression, (out) =>
+        runDump(command, {
+          timeoutMs: limits.timeoutMs,
+          maxBytes: this.exportSettings.dump.fileMaxBytes,
+          sink: out,
+        })
+      );
+      if (!output.writableEnded) output.end();
+      await finished(output);
+    } catch (error) {
+      output.destroy();
+      await fs.promises.rm(file, { force: true });
+      throw error;
+    }
+    const response = {
+      kind: 'dump',
+      path: file,
+      bytes: (await fs.promises.stat(file)).size,
+      uncompressedBytes: value.bytes,
+      client: binary.flavor,
+      compression,
+      tables: args.tables ?? [],
+      schemaOnly: args.schemaOnly === true,
+      dataOnly: args.dataOnly === true,
+      ...(command.tlsHostnameVerified === false ? { tlsHostnameVerified: false } : {}),
+    };
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(response) }],
+      structuredContent: response,
+    };
   }
 
   private async handleTestConnection(args: { connectionId: string; database?: string }) {
