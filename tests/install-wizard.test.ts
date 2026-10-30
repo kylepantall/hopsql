@@ -10,6 +10,7 @@ mock.module('@clack/prompts', () => ({
   note: vi.fn(),
   cancel: vi.fn(),
   select: prompt,
+  multiselect: prompt,
   text: prompt,
   password: prompt,
   confirm: prompt,
@@ -36,20 +37,24 @@ describe('guided direct setup', () => {
     vi.spyOn(process.stdout, 'isTTY', 'get').mockReturnValue(true);
     const stderr = vi.spyOn(console, 'error').mockImplementation(() => {});
     const priorHome = process.env.CODEX_HOME;
+    const priorWorkspace = process.env.HOPSQL_WORKSPACE;
     process.env.CODEX_HOME = join(directory, 'codex');
+    // Keeps workspace detection inside the fixture directory.
+    process.env.HOPSQL_WORKSPACE = directory;
     const fixture = join(directory, 'fixture.db');
     fs.writeFileSync(fixture, '');
     answers.push(
       'codex',
       'direct',
-      'local',
+      // sqlite: engine, file, ID, read-only, table access
       'sqlite',
       fixture,
+      'local',
       true,
+      'allowTables',
       'public.*',
-      'public.private',
       true,
-      'analytics',
+      // postgresql: engine, host, port, user, credentials, password, TLS, database, ID, read-only, tables
       'postgresql',
       'localhost',
       '5432',
@@ -58,9 +63,10 @@ describe('guided direct setup', () => {
       'masked-synthetic-fixture',
       true,
       'warehouse',
+      'analytics',
       false,
-      '',
-      '',
+      'denyTables',
+      'public.private',
       false,
       file
     );
@@ -69,10 +75,8 @@ describe('guided direct setup', () => {
       expect(answers).toHaveLength(0);
       const config = JSON.parse(fs.readFileSync(file, 'utf8'));
       expect(config.connections.local.readOnly).toBe(true);
-      expect(config.connections.local.policy).toEqual({
-        allowTables: ['public.*'],
-        denyTables: ['public.private'],
-      });
+      expect(config.connections.local.policy).toEqual({ allowTables: ['public.*'] });
+      expect(config.connections.analytics.policy).toEqual({ denyTables: ['public.private'] });
       expect(config.connections.analytics.readOnly).toBe(false);
       expect(config.connections.analytics.properties.sslmode).toBe('verify-full');
       expect(config.connections.analytics.properties.password).toBe('masked-synthetic-fixture');
@@ -85,6 +89,46 @@ describe('guided direct setup', () => {
     } finally {
       if (priorHome === undefined) delete process.env.CODEX_HOME;
       else process.env.CODEX_HOME = priorHome;
+      if (priorWorkspace === undefined) delete process.env.HOPSQL_WORKSPACE;
+      else process.env.HOPSQL_WORKSPACE = priorWorkspace;
+    }
+  });
+  it('offers the detected workspace and a checklist of its connections', async () => {
+    const directory = fs.mkdtempSync(join(tmpdir(), 'hopsql-pick-'));
+    directories.push(directory);
+    const workspace = join(directory, 'workspace');
+    const project = join(workspace, 'General', '.dbeaver');
+    fs.mkdirSync(project, { recursive: true });
+    fs.writeFileSync(
+      join(project, 'data-sources.json'),
+      JSON.stringify({
+        connections: {
+          picked: { name: 'Picked', driver: 'sqlite', configuration: { database: '/a.db' } },
+          skipped: { name: 'Skipped', driver: 'sqlite', configuration: { database: '/b.db' } },
+        },
+      })
+    );
+    vi.spyOn(process.stdin, 'isTTY', 'get').mockReturnValue(true);
+    vi.spyOn(process.stdout, 'isTTY', 'get').mockReturnValue(true);
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+    const saved = { home: process.env.CODEX_HOME, workspace: process.env.HOPSQL_WORKSPACE };
+    process.env.CODEX_HOME = join(directory, 'codex');
+    process.env.HOPSQL_WORKSPACE = workspace;
+    // client, source, detected workspace (picked from the list), connections, read-only
+    answers.push('codex', 'workspace', workspace, ['picked'], true);
+    try {
+      await runInstall([]);
+      expect(answers).toHaveLength(0);
+      const registration = spawnSync.mock.calls.at(-1)!;
+      expect(registration[1]).toContain('HOPSQL_ALLOWED_CONNECTIONS=picked');
+      expect(registration[1]).toContain(`HOPSQL_WORKSPACE=${workspace}`);
+    } finally {
+      for (const [key, value] of [
+        ['CODEX_HOME', saved.home],
+        ['HOPSQL_WORKSPACE', saved.workspace],
+      ] as const)
+        if (value === undefined) delete process.env[key];
+        else process.env[key] = value;
     }
   });
   it('validates selected workspace IDs without reading an inherited direct config', async () => {

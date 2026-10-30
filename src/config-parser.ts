@@ -118,6 +118,51 @@ function readJumpHosts(props: Record<string, unknown>): SshTunnelConfig[] | unde
   return hops.length > 0 ? hops : undefined;
 }
 
+/**
+ * Where DBeaver keeps its workspace on this platform, most common first. Linux
+ * also covers XDG_DATA_HOME, Flatpak and Snap installs.
+ */
+export function workspaceCandidates(
+  platform: NodeJS.Platform = os.platform(),
+  home = os.homedir(),
+  env: NodeJS.ProcessEnv = process.env
+): string[] {
+  const workspace = (dataDir: string) => path.join(dataDir, 'DBeaverData', 'workspace6');
+  if (platform === 'win32')
+    return [
+      ...(env.APPDATA ? [workspace(env.APPDATA)] : []),
+      workspace(path.join(home, 'AppData', 'Roaming')),
+    ].filter((value, index, all) => all.indexOf(value) === index);
+  if (platform === 'darwin') return [workspace(path.join(home, 'Library'))];
+  return [
+    ...(env.XDG_DATA_HOME ? [workspace(env.XDG_DATA_HOME)] : []),
+    workspace(path.join(home, '.local', 'share')),
+    workspace(path.join(home, '.var', 'app', 'io.dbeaver.DBeaverCommunity', 'data')),
+    workspace(path.join(home, 'snap', 'dbeaver-ce', 'current', '.local', 'share')),
+  ].filter((value, index, all) => all.indexOf(value) === index);
+}
+
+/** Candidate workspaces that hold at least one project with saved connections. */
+export function findWorkspaces(
+  platform: NodeJS.Platform = os.platform(),
+  home = os.homedir(),
+  env: NodeJS.ProcessEnv = process.env
+): string[] {
+  return workspaceCandidates(platform, home, env).filter((workspace) => {
+    try {
+      return fs
+        .readdirSync(workspace, { withFileTypes: true })
+        .some(
+          (entry) =>
+            entry.isDirectory() &&
+            fs.existsSync(path.join(workspace, entry.name, '.dbeaver', 'data-sources.json'))
+        );
+    } catch {
+      return false;
+    }
+  });
+}
+
 export class WorkspaceConfigParser {
   private config: WorkspaceConfig;
   private isNewFormat: boolean = false;
@@ -181,17 +226,7 @@ export class WorkspaceConfigParser {
   }
 
   private getDefaultWorkspacePath(): string {
-    const platform = os.platform();
-    const homeDir = os.homedir();
-
-    switch (platform) {
-      case 'win32':
-        return path.join(homeDir, 'AppData', 'Roaming', 'DBeaverData', 'workspace6');
-      case 'darwin':
-        return path.join(homeDir, 'Library', 'DBeaverData', 'workspace6');
-      default: // Linux and others
-        return path.join(homeDir, '.local', 'share', 'DBeaverData', 'workspace6');
-    }
+    return findWorkspaces()[0] ?? workspaceCandidates()[0];
   }
 
   /**

@@ -6,6 +6,7 @@ import {
   intro,
   outro,
   select,
+  multiselect,
   text,
   confirm,
   isCancel,
@@ -13,7 +14,7 @@ import {
   note,
   password,
 } from '@clack/prompts';
-import { WorkspaceConfigParser } from './config-parser.js';
+import { WorkspaceConfigParser, findWorkspaces, workspaceCandidates } from './config-parser.js';
 import { assertNoSymlinks, validateSetupConfig, writeSetupConfig } from './install-config.js';
 
 /**
@@ -340,18 +341,25 @@ export async function runInstall(args: string[]): Promise<void> {
     { value: 'codex', label: 'Codex' },
     { value: 'opencode', label: 'OpenCode' },
   ];
+  const detected = preselected
+    ? []
+    : clients.filter(
+        (entry) =>
+          spawnSync(entry.value, ['--version'], { stdio: 'ignore', timeout: 5000 }).status === 0
+      );
   const client =
     preselected ??
     answer(
       await select({
         message: 'Where should Hopsql be added?',
-        options: clients.map((entry) => ({
-          ...entry,
-          hint:
-            spawnSync(entry.value, ['--version'], { stdio: 'ignore', timeout: 5000 }).status === 0
-              ? 'detected'
-              : 'client must be installed',
-        })),
+        initialValue: detected[0]?.value,
+        // Installed clients first, so Enter picks one that will work.
+        options: [...detected, ...clients.filter((entry) => !detected.includes(entry))].map(
+          (entry) => ({
+            ...entry,
+            hint: detected.includes(entry) ? 'detected' : 'not found on this machine',
+          })
+        ),
       })
     );
   let replace = false;
@@ -372,13 +380,27 @@ export async function runInstall(args: string[]): Promise<void> {
       return;
     }
   }
+  const workspaces = process.env.HOPSQL_WORKSPACE
+    ? [expandPath(process.env.HOPSQL_WORKSPACE)]
+    : findWorkspaces();
+  const configs = existingConfigFiles();
   const mode = answer(
     await select({
       message: 'How do you want to connect?',
+      // Preselect whatever this machine already has.
+      initialValue: workspaces.length ? 'workspace' : configs.length ? 'config' : 'direct',
       options: [
+        {
+          value: 'workspace',
+          label: 'Import selected DBeaver connections',
+          hint: workspaces.length ? `found ${workspaces[0]}` : 'no DBeaver workspace found',
+        },
         { value: 'direct', label: 'Add database instances directly', hint: 'No DBeaver needed' },
-        { value: 'config', label: 'Use an existing Hopsql configuration' },
-        { value: 'workspace', label: 'Import selected DBeaver connections' },
+        {
+          value: 'config',
+          label: 'Use an existing Hopsql configuration',
+          hint: configs.length ? `found ${configs[0]}` : undefined,
+        },
       ],
     })
   );
@@ -389,9 +411,10 @@ export async function runInstall(args: string[]): Promise<void> {
       answer(
         await text({
           message: 'Save private connection configuration to',
-          defaultValue: join(homedir(), '.config', 'hopsql', 'connections.json'),
+          initialValue: freeConfigPath(),
           validate(value) {
-            if (value && existsSync(expandPath(value)))
+            if (!value?.trim()) return 'Enter a file path.';
+            if (existsSync(expandPath(value)))
               return 'File already exists. Choose a new file or use the existing-config path.';
           },
         })
@@ -409,20 +432,18 @@ export async function runInstall(args: string[]): Promise<void> {
       'Local storage'
     );
   } else if (mode === 'config') {
-    const file = expandPath(
-      answer(
-        await text({
-          message: 'Hopsql connection configuration path',
-          validate(value) {
-            try {
-              validateSetupConfig(expandPath(value || ''));
-            } catch {
-              return 'Enter a valid configuration with at least one connection and available credential environment references.';
-            }
-          },
-        })
-      )
-    );
+    const file = await choosePath({
+      message: 'Hopsql connection configuration',
+      found: configs,
+      fallback: join(homedir(), '.config', 'hopsql', 'connections.json'),
+      validate(value) {
+        try {
+          validateSetupConfig(value);
+        } catch {
+          return 'Enter a valid configuration with at least one connection and available credential environment references.';
+        }
+      },
+    });
     environment = {
       HOPSQL_CONFIG_FILE: file,
       HOPSQL_DISCOVER_WORKSPACE: 'false',
@@ -430,38 +451,30 @@ export async function runInstall(args: string[]): Promise<void> {
       HOPSQL_READ_ONLY: 'false',
     };
   } else {
-    const defaultWorkspace = new WorkspaceConfigParser({
-      workspacePath: process.env.HOPSQL_WORKSPACE,
-    }).getWorkspacePath();
-    const workspace = expandPath(
-      answer(
-        await text({
-          message: 'DBeaver workspace directory',
-          defaultValue: defaultWorkspace,
-          validate(value) {
-            return value && existsSync(expandPath(value)) ? undefined : 'Directory not found.';
-          },
-        })
-      )
-    );
+    const workspace = await choosePath({
+      message: 'DBeaver workspace',
+      found: workspaces,
+      fallback: workspaceCandidates()[0],
+      validate(value) {
+        return existsSync(value) ? undefined : 'Directory not found.';
+      },
+    });
     const available = await workspaceConnections(workspace);
-    note(
-      available.map(({ id }) => id).join(', ') || 'No saved connection IDs found.',
-      'Available connection IDs'
-    );
-    const allowed = answer(
-      await text({
-        message: 'Connection IDs to allow (comma-separated; required)',
-        validate(value) {
-          return value?.trim()
-            ? undefined
-            : 'Select explicit IDs so unrelated connections stay hidden.';
-        },
+    if (!available.length)
+      throw new Error('No saved connections found in that workspace. Save one in DBeaver first.');
+    const ids = answer(
+      await multiselect({
+        message: 'Connections the agent may use (space to toggle, enter to confirm)',
+        required: true,
+        options: available.map((connection) => ({
+          value: connection.id,
+          label: connection.name || connection.id,
+          hint: [connection.driver, connection.sshTunnel?.enabled ? 'SSH' : undefined]
+            .filter(Boolean)
+            .join(' · '),
+        })),
       })
     );
-    const ids = allowed.split(',').map((id) => id.trim());
-    if (ids.some((id) => !available.some((entry) => entry.id === id)))
-      throw new Error('A selected connection ID was not found in the workspace.');
     const readOnly = answer(
       await confirm({ message: 'Allow read-only queries only?', initialValue: true })
     );
@@ -494,33 +507,23 @@ async function collectDirectConfig(): Promise<{
 }> {
   const connections: Record<string, DirectEntry> = Object.create(null);
   do {
-    const id = answer(
-      await text({
-        message: 'Logical connection ID (visible to the agent)',
-        validate(value) {
-          return value &&
-            /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value) &&
-            !Object.hasOwn(connections, value)
-            ? undefined
-            : 'Use a unique ID with letters, numbers, dots, underscores or hyphens.';
-        },
-      })
-    );
     const driver = answer(
       await select({
         message: 'Database engine',
+        initialValue: 'postgresql',
         options: [
-          'postgresql',
-          'mysql',
-          'mariadb',
-          'mssql',
-          'oracle',
-          'sqlite',
-          'duckdb',
-          'clickhouse',
-        ].map((value) => ({ value, label: value })),
+          { value: 'postgresql', label: 'PostgreSQL' },
+          { value: 'mysql', label: 'MySQL' },
+          { value: 'mariadb', label: 'MariaDB' },
+          { value: 'mssql', label: 'SQL Server' },
+          { value: 'oracle', label: 'Oracle' },
+          { value: 'sqlite', label: 'SQLite', hint: 'local file' },
+          { value: 'duckdb', label: 'DuckDB', hint: 'local file' },
+          { value: 'clickhouse', label: 'ClickHouse' },
+        ],
       })
     );
+    const suggested = DRIVER_DEFAULTS[driver];
     const local = driver === 'sqlite' || driver === 'duckdb';
     const entry: DirectEntry = {
       driver,
@@ -533,6 +536,7 @@ async function collectDirectConfig(): Promise<{
       entry.host = answer(
         await text({
           message: 'Database hostname',
+          initialValue: 'localhost',
           validate(value) {
             return value && !/[\s/@?#]/.test(value)
               ? undefined
@@ -540,19 +544,11 @@ async function collectDirectConfig(): Promise<{
           },
         })
       );
-      const defaults: Record<string, number> = {
-        postgresql: 5432,
-        mysql: 3306,
-        mariadb: 3306,
-        mssql: 1433,
-        oracle: 1521,
-        clickhouse: 8443,
-      };
       entry.port = Number(
         answer(
           await text({
             message: 'Port',
-            defaultValue: String(defaults[driver]),
+            initialValue: String(suggested.port),
             validate(value) {
               return value && /^\d+$/.test(value) && Number(value) > 0 && Number(value) <= 65535
                 ? undefined
@@ -564,6 +560,7 @@ async function collectDirectConfig(): Promise<{
       entry.user = answer(
         await text({
           message: 'Database username',
+          initialValue: suggested.user,
           validate(value) {
             return value?.trim() ? undefined : 'Enter a username.';
           },
@@ -572,6 +569,7 @@ async function collectDirectConfig(): Promise<{
       const credentials = answer(
         await select({
           message: 'Database credentials',
+          initialValue: 'private',
           options: [
             {
               value: 'private',
@@ -599,16 +597,35 @@ async function collectDirectConfig(): Promise<{
         );
         if (value) entry.properties.password = value;
       } else if (credentials === 'env') {
-        entry.passwordEnv = answer(
-          await text({
-            message: 'Password environment variable name',
-            validate(value) {
-              return value && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value) && process.env[value]
-                ? undefined
-                : 'Enter the name of an available environment variable.';
-            },
-          })
-        );
+        // Offer variables that look like passwords; values are never shown.
+        const candidates = Object.keys(process.env)
+          .filter((name) => /PASS|PWD|SECRET|TOKEN/i.test(name) && process.env[name])
+          .sort();
+        const picked = candidates.length
+          ? answer(
+              await select({
+                message: 'Password environment variable',
+                options: [
+                  ...candidates.map((name) => ({ value: name, label: name })),
+                  { value: OTHER, label: 'Another variable…' },
+                ],
+              })
+            )
+          : OTHER;
+        entry.passwordEnv =
+          picked !== OTHER
+            ? picked
+            : answer(
+                await text({
+                  message: 'Password environment variable name',
+                  initialValue: `${driver.toUpperCase()}_PASSWORD`,
+                  validate(value) {
+                    return value && /^[A-Za-z_][A-Za-z0-9_]*$/.test(value) && process.env[value]
+                      ? undefined
+                      : 'Enter the name of an available environment variable.';
+                  },
+                })
+              );
       }
       const tls = answer(
         await confirm({ message: 'Use TLS with verified server certificates?', initialValue: true })
@@ -625,6 +642,7 @@ async function collectDirectConfig(): Promise<{
     entry.database = answer(
       await text({
         message: local ? 'Existing database file path' : 'Database name / service',
+        initialValue: local ? process.cwd() + '/' : suggested.database,
         validate(value) {
           if (!value?.trim()) return 'A database is required.';
           if (local && !existsSync(expandPath(value))) return 'Database file not found.';
@@ -632,19 +650,49 @@ async function collectDirectConfig(): Promise<{
       })
     );
     if (local) entry.database = expandPath(entry.database);
+    const id = answer(
+      await text({
+        message: 'Connection ID (visible to the agent)',
+        initialValue: suggestConnectionId(driver, entry.database, connections),
+        validate(value) {
+          return value &&
+            /^[A-Za-z0-9][A-Za-z0-9_.-]{0,127}$/.test(value) &&
+            !Object.hasOwn(connections, value)
+            ? undefined
+            : 'Use a unique ID with letters, numbers, dots, underscores or hyphens.';
+        },
+      })
+    );
     entry.readOnly = answer(
       await confirm({ message: `Keep ${id} read-only?`, initialValue: true })
     );
-    for (const [key, message] of [
-      ['allowTables', 'Allowed tables (comma-separated; Enter for all)'],
-      ['denyTables', 'Blocked tables (comma-separated; Enter for none)'],
-    ] as const) {
-      const value = answer(await text({ message }));
-      if (value?.trim())
-        (entry.policy ??= {})[key] = value
+    const tables = answer(
+      await select({
+        message: 'Which tables may the agent see?',
+        initialValue: 'all',
+        options: [
+          { value: 'all', label: 'All tables' },
+          { value: 'allowTables', label: 'Only specific tables…' },
+          { value: 'denyTables', label: 'All except specific tables…' },
+        ],
+      })
+    );
+    if (tables !== 'all') {
+      const value = answer(
+        await text({
+          message: tables === 'allowTables' ? 'Allowed tables' : 'Blocked tables',
+          placeholder: 'public.orders, public.customers',
+          validate(input) {
+            return input?.trim() ? undefined : 'Enter at least one table, comma-separated.';
+          },
+        })
+      );
+      entry.policy = {
+        [tables]: value
           .split(',')
           .map((name) => name.trim())
-          .filter(Boolean);
+          .filter(Boolean),
+      };
     }
     connections[id] = entry;
   } while (
@@ -652,6 +700,86 @@ async function collectDirectConfig(): Promise<{
     answer(await confirm({ message: 'Add another database instance?', initialValue: false }))
   );
   return { version: 1, connections };
+}
+
+const OTHER = '\u0000other';
+
+/** Prefilled answers for direct setup, so Enter gives a working local default. */
+const DRIVER_DEFAULTS: Record<string, { port?: number; user?: string; database?: string }> = {
+  postgresql: { port: 5432, user: 'postgres', database: 'postgres' },
+  mysql: { port: 3306, user: 'root', database: 'mysql' },
+  mariadb: { port: 3306, user: 'root', database: 'mysql' },
+  mssql: { port: 1433, user: 'sa', database: 'master' },
+  oracle: { port: 1521, user: 'system', database: 'FREEPDB1' },
+  clickhouse: { port: 8443, user: 'default', database: 'default' },
+  sqlite: {},
+  duckdb: {},
+};
+
+/** A readable, unique ID such as "postgresql-orders". */
+export function suggestConnectionId(
+  driver: string,
+  database: string,
+  taken: Record<string, unknown>
+): string {
+  const name = (database.split(/[\\/]/).pop() ?? '').replace(/\.[^.]+$/, '');
+  const base = `${driver}-${name}`.replace(/[^A-Za-z0-9_.-]+/g, '-').replace(/-+$/, '') || driver;
+  let id = base;
+  for (let n = 2; Object.hasOwn(taken, id); n++) id = `${base}-${n}`;
+  return id;
+}
+
+/** Hopsql (and legacy OmniSQL) configuration files that already exist. */
+export function existingConfigFiles(home = homedir(), env = process.env): string[] {
+  return [
+    env.HOPSQL_CONFIG_FILE,
+    join(home, '.config', 'hopsql', 'connections.json'),
+    join(home, '.config', 'omnisql', 'connections.json'),
+  ].filter(
+    (file, index, all): file is string =>
+      !!file && all.indexOf(file) === index && existsSync(expandPath(file))
+  );
+}
+
+/** The default config path, or the first numbered variant that is still free. */
+export function freeConfigPath(home = homedir()): string {
+  const base = join(home, '.config', 'hopsql', 'connections');
+  if (!existsSync(`${base}.json`)) return `${base}.json`;
+  let n = 2;
+  while (existsSync(`${base}-${n}.json`)) n++;
+  return `${base}-${n}.json`;
+}
+
+/** Pick a detected path from a list, falling back to a prefilled text answer. */
+async function choosePath(options: {
+  message: string;
+  found: string[];
+  fallback: string;
+  validate: (path: string) => string | undefined;
+}): Promise<string> {
+  if (options.found.length) {
+    const picked = answer(
+      await select({
+        message: options.message,
+        initialValue: options.found[0],
+        options: [
+          ...options.found.map((value) => ({ value, label: value, hint: 'found' })),
+          { value: OTHER, label: 'Another path…' },
+        ],
+      })
+    );
+    const problem = picked === OTHER ? undefined : options.validate(picked);
+    if (picked !== OTHER && !problem) return picked;
+  }
+  return expandPath(
+    answer(
+      await text({
+        message: options.message,
+        initialValue: options.fallback,
+        validate: (value) => (value ? options.validate(expandPath(value)) : 'Enter a path.'),
+      })
+    )
+  );
 }
 
 function expandPath(value: string): string {
