@@ -9,6 +9,7 @@ mock.module('@clack/prompts', () => ({
   outro: vi.fn(),
   note: vi.fn(),
   cancel: vi.fn(),
+  log: { step: vi.fn(), success: vi.fn(), message: vi.fn() },
   select: prompt,
   multiselect: prompt,
   text: prompt,

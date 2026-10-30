@@ -13,6 +13,7 @@ import {
   cancel,
   note,
   password,
+  log,
 } from '@clack/prompts';
 import { WorkspaceConfigParser, findWorkspaces, workspaceCandidates } from './config-parser.js';
 import { assertNoSymlinks, validateSetupConfig, writeSetupConfig } from './install-config.js';
@@ -120,7 +121,7 @@ export function buildRemoveCommand(
   return undefined;
 }
 
-function runClient(command: string, args: string[], stdio: 'inherit' | 'ignore' = 'inherit') {
+function runClient(command: string, args: string[], stdio: 'inherit' | 'pipe' = 'inherit') {
   const invocation = clientInvocation(command, args);
   const result = spawnSync(invocation.command, invocation.args, {
     stdio,
@@ -140,13 +141,14 @@ function runClient(command: string, args: string[], stdio: 'inherit' | 'ignore' 
 }
 
 /** Remove an existing registration so a replacement can be added under the same name. */
-function removeClientEntry(client: string): void {
+function removeClientEntry(client: string, guided = false): void {
   const remove = buildRemoveCommand(client);
   if (!remove)
     throw new Error(
       `Remove the existing hopsql entry from ${client}'s MCP settings, then run setup again.`
     );
-  const result = runClient(remove.command, remove.args);
+  const result = runClient(remove.command, remove.args, guided ? 'pipe' : 'inherit');
+  if (result.status !== 0 && guided) showClientOutput(result);
   if (result.status !== 0)
     throw new Error(
       `${remove.command} could not remove the existing hopsql entry (exit ${result.status ?? result.signal}).`
@@ -204,7 +206,16 @@ function assertClientDestination(client: string): void {
   }
 }
 
-export function installClient(args: string[], environment: Record<string, string> = {}): void {
+/**
+ * Register Hopsql with a client. Scripted installs report on stderr (stdout stays
+ * free for tooling); guided setup passes `guided` so progress uses the prompt UI
+ * instead of echoing the raw client command.
+ */
+export function installClient(
+  args: string[],
+  environment: Record<string, string> = {},
+  options: { guided?: boolean } = {}
+): void {
   const [client, ...flags] = args;
   const settings = { ...environment };
   if (flags.includes('--read-only') && flags.includes('--allow-writes'))
@@ -261,20 +272,40 @@ export function installClient(args: string[], environment: Record<string, string
     );
   if (settings.HOPSQL_WORKSPACE && !statSync(settings.HOPSQL_WORKSPACE).isDirectory())
     throw new Error('Workspace must be a directory.');
-  console.error([command, ...commandArgs.map((value) => JSON.stringify(value))].join(' '));
+  const guided = options.guided === true;
+  if (!guided)
+    console.error([command, ...commandArgs.map((value) => JSON.stringify(value))].join(' '));
   if (dryRun) return;
   if (replace && hasClientEntry(client)) {
-    removeClientEntry(client);
-    console.error('Removed the existing hopsql entry.');
+    removeClientEntry(client, guided);
+    if (guided) log.step('Removed the existing hopsql entry');
+    else console.error('Removed the existing hopsql entry.');
   }
   assertClientDestination(client);
-  const result = runClient(command, commandArgs);
+  const result = runClient(command, commandArgs, guided ? 'pipe' : 'inherit');
   if (result.status !== 0) {
+    if (guided) showClientOutput(result);
     throw new Error(
       `${command} could not add Hopsql (exit ${result.status ?? result.signal}). Check the client output above.`
     );
   }
-  console.error('Hopsql added. Start a new client session to use it.');
+  if (guided) log.success(`Added hopsql to ${CLIENT_LABELS[client] ?? client}`);
+  else console.error('Hopsql added. Start a new client session to use it.');
+}
+
+const CLIENT_LABELS: Record<string, string> = {
+  claude: 'Claude Code',
+  codex: 'Codex',
+  opencode: 'OpenCode',
+};
+
+/** Show a client's captured output, only when it failed. */
+function showClientOutput(result: ReturnType<typeof spawnSync>): void {
+  const output = [result.stdout, result.stderr]
+    .map((part) => (part ? part.toString().trim() : ''))
+    .filter(Boolean)
+    .join('\n');
+  if (output) log.message(output);
 }
 
 function answer<T>(value: T | symbol): T {
@@ -485,7 +516,7 @@ export async function runInstall(args: string[]): Promise<void> {
       HOPSQL_READ_ONLY: String(readOnly),
     };
   }
-  installClient(replace ? [client, '--replace'] : [client], environment);
+  installClient(replace ? [client, '--replace'] : [client], environment, { guided: true });
   outro('Ready. Start a new client session, then ask it to list your database connections.');
 }
 
