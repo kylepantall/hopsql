@@ -141,6 +141,8 @@ For bastions without public SSH, add an `ssm` block in `HOPSQL_CONFIG_FILE`: on 
 
 #### Replacing a port-forward script
 
+`hopsql manage` writes these settings for you (see the README's *Manage connections*); the JSON below is the same thing by hand.
+
 A DBeaver connection that points at `localhost` because a script runs `aws ssm start-session` first can be managed by Hopsql instead:
 
 | Setting | Replaces |

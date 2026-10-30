@@ -17,7 +17,24 @@ if (!supported) {
   );
   process.exit(1);
 }
-// Handle CLI arguments
+// Handle CLI arguments. MCP clients start the server with piped stdio, so a
+// bare `hopsql` typed in a terminal opens the manage UI instead.
+const command = process.argv[2];
+if (
+  command === 'manage' ||
+  (command === undefined && process.stdin.isTTY && process.stdout.isTTY)
+) {
+  try {
+    const { runManage } = await import('./manage.js');
+    await runManage();
+  } catch (error) {
+    console.error(error instanceof Error ? error.message : String(error));
+    process.exit(1);
+  }
+  process.exit(0);
+}
+if (command === 'serve') process.argv.splice(2, 1);
+
 if (process.argv[2] === 'install') {
   try {
     const { runInstall } = await import('./install.js');
@@ -33,7 +50,9 @@ if (process.argv.includes('--help') || process.argv.includes('-h')) {
   console.error(`
 Hopsql MCP Server v${VERSION}
 
-Usage: hopsql [options]
+Usage: hopsql                 Manage connections (in a terminal; MCP clients get the server)
+       hopsql manage          Turn connections read-only, set up SSM hops and secrets
+       hopsql serve [options] Run the MCP server even in a terminal
        hopsql install [claude|codex|opencode] [--config <file> | --workspace <directory>] [--allow <ids>] [--allow-writes] [--dry-run]
 
 Quick setup:

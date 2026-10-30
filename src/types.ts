@@ -72,6 +72,8 @@ export interface AwsSecretConfig {
 export interface ConnectionOverride {
   ssm?: SsmConfig;
   awsSecret?: AwsSecretConfig;
+  /** Replaces the connection's own read-only flag. */
+  readOnly?: boolean;
 }
 
 /**

@@ -18,6 +18,7 @@ Give Claude Code, Codex and OpenCode read-only access to the databases you alrea
 | **Reliability** | Dropped tunnels reconnect on the same local port, pools rebuild, and read-only queries retry once. |
 | **Postgres TLS** | No `sslmode` behaves like DBeaver (`prefer`): TLS first, plaintext only if the server has none. |
 | **Dumps and exports** | New `dump_table` / `dump_database` (via `pg_dump` / `mysqldump`) and streaming `export_data` for large results. |
+| **Manage UI** | `hopsql` in a terminal: make a connection read-only, or add an AWS SSM hop and Secrets Manager login, without editing JSON. |
 | **Install** | One command from GitHub for macOS, Linux and Windows; no npm package. |
 | **Names** | `hopsql` binary and MCP entry, `HOPSQL_*` settings. Legacy `OMNISQL_*` settings still work. |
 
@@ -142,6 +143,18 @@ Add the following MCP entry to Claude Desktop's `claude_desktop_config.json`, or
 ```
 
 Use the absolute launcher path the installer prints. On Windows, use `"command": "cmd"` and `"args": ["/c", "C:\\Users\\you\\AppData\\Local\\hopsql\\bin\\hopsql.cmd"]`.
+
+## Manage connections
+
+Run `hopsql` (or `hopsql manage`) in a terminal to pick a connection and:
+
+| Action | Effect |
+|---|---|
+| Make read-only / Allow writes | Per-connection write switch |
+| Set up an AWS SSM hop | Bastion by Name tag or instance ID, remote host/port, optional Secrets Manager login |
+| Remove the AWS SSM hop | Back to the connection's own settings |
+
+Changes are saved to `~/.config/hopsql/overrides.json` (`HOPSQL_OVERRIDES_FILE` to move it) and apply on the next query; no re-registration. They win over `overrides` in `HOPSQL_CONFIG_FILE`. `HOPSQL_READ_ONLY=true` still makes every connection read-only. MCP clients start Hopsql with piped stdio, so they still get the server; `hopsql serve` forces it in a terminal.
 
 ## One server, many instances
 

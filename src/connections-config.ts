@@ -5,6 +5,9 @@ import type {
   SsmConfig,
 } from './types.js';
 import { validateAccessRule } from './policy/access.js';
+import fs from 'node:fs';
+import { homedir } from 'node:os';
+import { dirname, join } from 'node:path';
 import { readPrivateFile } from './runtime/private-file.js';
 
 const KEYS = [
@@ -155,9 +158,12 @@ export function loadConnectionOverrides(
   const result: Record<string, ConnectionOverride> = {};
   for (const [key, value] of Object.entries(overrides)) {
     const entry = object(value, `Override ${key}`);
-    if (Object.keys(entry).some((k) => k !== 'ssm' && k !== 'awsSecret'))
+    if (Object.keys(entry).some((k) => !['ssm', 'awsSecret', 'readOnly'].includes(k)))
       throw new Error(`Unknown setting on override ${key}`);
+    if (entry.readOnly !== undefined && typeof entry.readOnly !== 'boolean')
+      throw new Error(`Override ${key}: readOnly must be true or false`);
     result[key] = {
+      ...(entry.readOnly === undefined ? {} : { readOnly: entry.readOnly }),
       ...(entry.ssm === undefined ? {} : { ssm: parseSsm(entry.ssm, `Override ${key}`) }),
       ...(entry.awsSecret === undefined
         ? {}
@@ -166,6 +172,61 @@ export function loadConnectionOverrides(
   }
   return result;
 }
+/** The overrides `hopsql manage` edits; loaded on every start, no registration needed. */
+export function managedOverridesPath(): string {
+  return (
+    process.env.HOPSQL_OVERRIDES_FILE || join(homedir(), '.config', 'hopsql', 'overrides.json')
+  );
+}
+
+export function loadManagedOverrides(
+  file = managedOverridesPath()
+): Record<string, ConnectionOverride> {
+  return fs.existsSync(file) ? loadConnectionOverrides(file) : {};
+}
+
+/**
+ * Replace the managed overrides. Written to a private temp file and renamed,
+ * so the server never reads a half-written file.
+ */
+export function saveManagedOverrides(
+  overrides: Record<string, ConnectionOverride>,
+  file = managedOverridesPath()
+): void {
+  const kept = Object.fromEntries(
+    Object.entries(overrides).filter(([, value]) => Object.keys(value).length > 0)
+  );
+  fs.mkdirSync(dirname(file), { recursive: true, mode: 0o700 });
+  if (fs.existsSync(file) && fs.lstatSync(file).isSymbolicLink())
+    throw new Error('Managed overrides will not be written through a symlink');
+  const temp = `${file}.${process.pid}.tmp`;
+  fs.writeFileSync(temp, JSON.stringify({ version: 1, overrides: kept }, null, 2) + '\n', {
+    mode: 0o600,
+    flag: 'wx',
+  });
+  try {
+    loadConnectionOverrides(temp);
+    fs.renameSync(temp, file);
+  } catch (error) {
+    fs.rmSync(temp, { force: true });
+    throw error;
+  }
+}
+
+/** Layer an override onto a connection; later settings win. */
+export function applyOverride(
+  connection: DatabaseConnection,
+  override: ConnectionOverride | undefined
+): DatabaseConnection {
+  if (!override) return connection;
+  return {
+    ...connection,
+    ...(override.ssm ? { ssm: override.ssm } : {}),
+    ...(override.awsSecret ? { awsSecret: override.awsSecret } : {}),
+    ...(override.readOnly === undefined ? {} : { readonly: override.readOnly }),
+  };
+}
+
 /** One server can use explicitly configured instances and discovered workspace connections. */
 export function loadConfiguredConnections(
   file = process.env.HOPSQL_CONFIG_FILE

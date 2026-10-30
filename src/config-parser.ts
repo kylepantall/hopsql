@@ -1,5 +1,10 @@
 import { sqlDialect } from './policy/analyzer.js';
-import { loadConfiguredConnections, loadConnectionOverrides } from './connections-config.js';
+import {
+  applyOverride,
+  loadConfiguredConnections,
+  loadConnectionOverrides,
+  loadManagedOverrides,
+} from './connections-config.js';
 import { booleanSetting } from './runtime-config.js';
 import { registerConnectionPrivacy, registerPrivateValue, sanitizeDiagnostic } from './privacy.js';
 import fs from 'fs';
@@ -298,7 +303,10 @@ export class WorkspaceConfigParser {
   }
 
   async parseConnections(): Promise<DatabaseConnection[]> {
-    const configured = loadConfiguredConnections();
+    const managed = loadManagedOverrides();
+    const configured = loadConfiguredConnections().map((c) =>
+      applyOverride(c, managed[c.id] ?? managed[c.name])
+    );
     configured.forEach(registerConnectionPrivacy);
     if (!this.discoverWorkspace())
       return structuredClone(configured.map((c) => ({ ...c, baseId: c.id })));
@@ -332,16 +340,13 @@ export class WorkspaceConfigParser {
     const overrides = loadConnectionOverrides();
     // Matched by id first, then by name, so an override survives DBeaver
     // regenerating an id only when the user chose to key it by name.
-    discovered = discovered.map((c) => {
-      const override = overrides[c.id] ?? overrides[c.name];
-      return override
-        ? {
-            ...c,
-            ...(override.ssm ? { ssm: override.ssm } : {}),
-            ...(override.awsSecret ? { awsSecret: override.awsSecret } : {}),
-          }
-        : c;
-    });
+    // The managed file (hopsql manage) is applied last, so its edits win.
+    discovered = discovered.map((c) =>
+      applyOverride(
+        applyOverride(c, overrides[c.id] ?? overrides[c.name]),
+        managed[c.id] ?? managed[c.name]
+      )
+    );
     const ids = new Set(configured.map((c) => c.id));
     for (const c of discovered) {
       if (ids.has(c.id))

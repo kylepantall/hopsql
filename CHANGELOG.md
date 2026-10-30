@@ -12,6 +12,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - SSM `targetName`: find the bastion by its `Name` tag on every (re)connect.
 - SSM `remoteHost` / `remotePort`: port-forward to a host other than the DBeaver connection's (e.g. one that points at a script's `localhost` forward).
 - `awsSecret`: read `username` / `password` from AWS Secrets Manager.
+- `hopsql manage` (or bare `hopsql` in a terminal): per-connection read-only switch and AWS SSM / Secrets Manager setup, saved to `~/.config/hopsql/overrides.json`. Overrides also accept `readOnly`.
+- Unknown SSH host keys can be approved from the MCP client's prompt.
+
+### Changed
+
+- ⚠️ `hopsql` with no arguments in a terminal opens the manage UI; use `hopsql serve` to run the server there.
+
+### Fixed
+
+- PostgreSQL `statement_timeout` is set per session, so RDS Proxy no longer rejects connections (0A000).
+- High-severity audit findings in `@azure/msal-node`, `body-parser` and `zod`.
 
 ## [1.0.0] - 2026-10-30
 
