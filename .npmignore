@@ -1,0 +1,10 @@
+src/
+docs/
+examples/
+scripts/
+.gitignore
+tsconfig.json
+*.test.ts
+.env*
+database-mcp/
+dist/

@@ -1,0 +1,835 @@
+import {
+  tableNameParts,
+  catalogLiteral,
+  quoteQualifiedIdentifier,
+} from './metadata/identifiers.js';
+import { publicConnection, sanitizeDiagnostic } from './privacy.js';
+import { mysqlNameEquals, duckdbNameEquals } from './metadata/names.js';
+import { sqlDialect } from './policy/analyzer.js';
+import { validateReadStatement, validateStatement } from './policy/sql.js';
+/**
+ * Resolve the DB client CLI executable path.
+ *
+ * The CLI fallback is only used for drivers without a native implementation.
+ * Configure the path explicitly via the HOPSQL_CLI_PATH environment variable.
+ * Returns an empty string when not configured; callers must handle this case.
+ */
+export function findCliExecutable(): string {
+  return process.env.HOPSQL_CLI_PATH ?? '';
+}
+
+/**
+ * Dialect tokens that the rest of the codebase pattern-matches on to pick a
+ * native driver. A driver id containing any of these is already routable.
+ */
+const DIALECT_TOKENS = [
+  'postgres',
+  'postgresql',
+  'cockroach',
+  'timescale',
+  'redshift',
+  'yugabyte',
+  'alloydb',
+  'supabase',
+  'neon',
+  'citus',
+  'mysql',
+  'mariadb',
+  'mssql',
+  'sqlserver',
+  'microsoft',
+  'sqlite',
+  'duckdb',
+  'clickhouse',
+  'oracle',
+  'db2',
+  'hana',
+  'mongodb',
+  'redis',
+];
+
+/**
+ * Map a workspace `provider` id onto a dialect token.
+ *
+ * Providers are stable across custom drivers: a hand-rolled driver keeps
+ * `provider: "postgresql"` even when its driver id is an opaque UUID.
+ */
+const PROVIDER_DIALECTS: Record<string, string> = {
+  postgresql: 'postgresql',
+  postgres: 'postgresql',
+  cockroach: 'cockroachdb',
+  timescale: 'timescaledb',
+  redshift: 'redshift',
+  yugabyte: 'yugabytedb',
+  greenplum: 'postgresql',
+  mysql: 'mysql',
+  mariadb: 'mariadb',
+  mssql: 'mssql',
+  sqlserver: 'mssql',
+  sqlite: 'sqlite',
+  duckdb: 'duckdb',
+  clickhouse: 'clickhouse',
+  oracle: 'oracle',
+  db2: 'db2',
+};
+
+/**
+ * Driver ids that are opaque identifiers rather than descriptive names.
+ *
+ * Custom drivers are frequently registered under a generated UUID. Those carry
+ * no dialect, but they are hex, and `db2` is a valid hex triple - so a
+ * substring scan would judge `a1db2f3c-...` routable and strand the connection
+ * on a dialect it has nothing to do with. Recognise the shape and skip it.
+ */
+function isOpaqueDriverId(driver: string): boolean {
+  return /^\{?[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\}?$/i.test(driver);
+}
+
+/**
+ * True when a driver id already carries a dialect the native routing understands.
+ */
+export function isRoutableDriverId(driver: string): boolean {
+  if (isOpaqueDriverId(driver)) {
+    return false;
+  }
+  const d = driver.toLowerCase();
+  return DIALECT_TOKENS.some((token) => d.includes(token));
+}
+
+/**
+ * Extract the dialect from a JDBC URL, tolerating wrapper sub-protocols.
+ *
+ * Custom drivers commonly layer a wrapper in front of the engine sub-protocol,
+ * e.g. the AWS Advanced JDBC Wrapper's `jdbc:aws-wrapper:postgresql://host/db`.
+ * Scan every colon-delimited segment and return the first recognised dialect,
+ * so unknown wrapper names never mask the engine behind them.
+ */
+export function dialectFromJdbcUrl(url: string): string | null {
+  if (!url) {
+    return null;
+  }
+
+  const withoutAuthority = url.split('://')[0].toLowerCase();
+  const segments = withoutAuthority.split(':').filter((s) => s && s !== 'jdbc');
+
+  for (const segment of segments) {
+    if (PROVIDER_DIALECTS[segment]) {
+      return PROVIDER_DIALECTS[segment];
+    }
+  }
+
+  // Fall back to a looser match so e.g. `mysql8` or `postgresql-42` still resolve.
+  for (const segment of segments) {
+    const token = DIALECT_TOKENS.find((t) => segment.includes(t));
+    if (token) {
+      return token;
+    }
+  }
+
+  return null;
+}
+
+/**
+ * Resolve a driver id that the native routing can dispatch on.
+ *
+ * Stock workspace drivers ("postgres-jdbc", "mysql8") already contain their
+ * dialect and are returned untouched. Custom drivers may use an opaque id -
+ * a UUID, say - in which case fall back to the connection's `provider` and
+ * finally to the JDBC URL's sub-protocol.
+ *
+ * Returns the original id when nothing resolves, so error messages still name
+ * the driver the user actually configured.
+ */
+export function resolveDriverDialect(
+  driver: string | undefined,
+  provider?: string,
+  url?: string
+): string {
+  const rawDriver = driver ?? '';
+
+  if (rawDriver && isRoutableDriverId(rawDriver)) {
+    return rawDriver;
+  }
+
+  const providerKey = (provider ?? '').toLowerCase();
+  if (PROVIDER_DIALECTS[providerKey]) {
+    return PROVIDER_DIALECTS[providerKey];
+  }
+  if (providerKey && isRoutableDriverId(providerKey)) {
+    return providerKey;
+  }
+
+  const fromUrl = dialectFromJdbcUrl(url ?? '');
+  if (fromUrl) {
+    return fromUrl;
+  }
+
+  return rawDriver || providerKey;
+}
+
+export interface JdbcEndpoint {
+  host?: string;
+  port?: number;
+  database?: string;
+}
+
+/**
+ * Pull the port off an authority, tolerating IPv6 literals and host lists.
+ *
+ * Failover URLs carry several endpoints (`host1:5432,host2:5432`); the first is
+ * the one to connect to.
+ */
+function splitAuthority(authority: string): JdbcEndpoint {
+  const first = authority.split(',')[0];
+  if (!first) {
+    return {};
+  }
+
+  // Bracketed IPv6: drop the brackets, since the native drivers take a bare
+  // address, and read the port from after them.
+  const bracketed = first.match(/^\[([^\]]+)\](?::(\d+))?$/);
+  if (bracketed) {
+    const port = bracketed[2] ? parseInt(bracketed[2], 10) : undefined;
+    return port === undefined || Number.isNaN(port)
+      ? { host: bracketed[1] }
+      : { host: bracketed[1], port };
+  }
+
+  // Only the final colon separates the port, so bare IPv6 literals survive.
+  const portMatch = first.match(/^(.*):(\d+)$/);
+  if (!portMatch) {
+    return first ? { host: first } : {};
+  }
+  const port = parseInt(portMatch[2], 10);
+  return Number.isNaN(port) ? { host: portMatch[1] } : { host: portMatch[1], port };
+}
+
+/**
+ * Read a database name out of the `;key=value` property list some drivers use
+ * in place of a path segment (SQL Server, Sybase, SAP HANA).
+ */
+function databaseFromUrlProperties(propertySection: string): string | undefined {
+  const names = ['databasename', 'database', 'db', 'initial catalog', 'initialcatalog'];
+  for (const pair of propertySection.split(/[;&]/)) {
+    const eq = pair.indexOf('=');
+    if (eq === -1) continue;
+    const key = pair.slice(0, eq).trim().toLowerCase();
+    const value = pair.slice(eq + 1).trim();
+    if (value && names.includes(key)) {
+      return value;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Oracle addresses the database by SID or service name rather than a path:
+ *   jdbc:oracle:thin:@host:1521:ORCL
+ *   jdbc:oracle:thin:@//host:1521/ORCLPDB
+ * A full TNS descriptor (`@(DESCRIPTION=...)`) is left alone - there is no
+ * single endpoint to report.
+ */
+function parseOracleUrl(target: string): JdbcEndpoint {
+  if (target.startsWith('(')) {
+    return {};
+  }
+
+  // EZConnect form, which is just an authority with a service path.
+  if (target.startsWith('//')) {
+    const rest = target.slice(2);
+    const slashIdx = rest.indexOf('/');
+    const authority = slashIdx === -1 ? rest : rest.slice(0, slashIdx);
+    const service = slashIdx === -1 ? '' : rest.slice(slashIdx + 1);
+    const endpoint = splitAuthority(authority);
+    return service ? { ...endpoint, database: service } : endpoint;
+  }
+
+  // host:port:SID
+  const sidForm = target.match(/^([^:/]+):(\d+):(.+)$/);
+  if (sidForm) {
+    return { host: sidForm[1], port: parseInt(sidForm[2], 10), database: sidForm[3] };
+  }
+
+  const endpoint = splitAuthority(target.split('/')[0]);
+  const service = target.includes('/') ? target.slice(target.indexOf('/') + 1) : '';
+  return service ? { ...endpoint, database: service } : endpoint;
+}
+
+/**
+ * File-backed engines put a path where a network URL would put an authority:
+ *   jdbc:sqlite:/var/data/app.db
+ *   jdbc:h2:file:/var/data/app
+ *   jdbc:duckdb:C:\\data\\app.duckdb
+ * There is no host; the path is the database.
+ */
+function parseFileJdbcUrl(url: string): JdbcEndpoint {
+  const withoutScheme = url.replace(/^jdbc:/i, '');
+  const colonIdx = withoutScheme.indexOf(':');
+  if (colonIdx === -1) {
+    return {};
+  }
+
+  let target = withoutScheme.slice(colonIdx + 1);
+  // H2 and friends prefix a storage mode that is not part of the path.
+  target = target.replace(/^(file|mem|nio|split):/i, '');
+  target = target.split('?')[0].split(';')[0];
+
+  return target ? { database: target } : {};
+}
+
+/**
+ * Parse host, port and database out of a JDBC URL.
+ *
+ * This is the authority for URL-mode connections, where the workspace leaves
+ * `host`/`port`/`database` at placeholder values and records the real endpoint
+ * only here. Wrapper sub-protocols, credentials in the authority, host lists,
+ * query strings and `;key=value` property tails are all tolerated; anything
+ * genuinely unparseable comes back empty rather than half-right.
+ */
+export function parseJdbcUrl(url: string): JdbcEndpoint {
+  if (!url) {
+    return {};
+  }
+
+  const trimmed = url.trim();
+
+  // Oracle never uses an authority, even for network connections.
+  const oracle = trimmed.match(/^jdbc:oracle:[a-z]*:?@(.*)$/i);
+  if (oracle) {
+    return parseOracleUrl(oracle[1]);
+  }
+
+  const authorityIdx = trimmed.indexOf('://');
+  if (authorityIdx === -1) {
+    return parseFileJdbcUrl(trimmed);
+  }
+
+  let remainder = trimmed.slice(authorityIdx + 3);
+
+  // A `;key=value` tail can carry the database, so keep it before trimming.
+  const semicolonIdx = remainder.indexOf(';');
+  const propertySection = semicolonIdx === -1 ? '' : remainder.slice(semicolonIdx + 1);
+  if (semicolonIdx !== -1) {
+    remainder = remainder.slice(0, semicolonIdx);
+  }
+
+  const questionIdx = remainder.indexOf('?');
+  const querySection = questionIdx === -1 ? '' : remainder.slice(questionIdx + 1);
+  if (questionIdx !== -1) {
+    remainder = remainder.slice(0, questionIdx);
+  }
+
+  const slashIdx = remainder.indexOf('/');
+  let authority = slashIdx === -1 ? remainder : remainder.slice(0, slashIdx);
+  const pathDatabase = slashIdx === -1 ? '' : remainder.slice(slashIdx + 1);
+
+  // Credentials embedded in the authority are not part of the host. The last
+  // '@' wins, since a password may legitimately contain one.
+  const atIdx = authority.lastIndexOf('@');
+  if (atIdx !== -1) {
+    authority = authority.slice(atIdx + 1);
+  }
+
+  const endpoint = splitAuthority(authority);
+
+  const database =
+    pathDatabase ||
+    databaseFromUrlProperties(propertySection) ||
+    databaseFromUrlProperties(querySection);
+  if (database) {
+    endpoint.database = database;
+  }
+
+  return endpoint;
+}
+
+/**
+ * Validate SQL query for basic safety
+ */
+export function validateQuery(query: string): string | null {
+  return validateStatement(query);
+}
+
+export function enforceReadOnly(query: string): string | null {
+  return validateReadStatement(query);
+}
+
+/** Validate target names without changing which saved connection they identify. */
+export function sanitizeConnectionId(connectionId: string): string {
+  if (!connectionId || typeof connectionId !== 'string') {
+    throw new Error('Connection ID must be a non-empty string');
+  }
+
+  const { baseId, databaseOverride } = parseConnectionId(connectionId);
+
+  if (
+    connectionId.length > 512 ||
+    [...connectionId].some((char) => char.charCodeAt(0) < 32 || char.charCodeAt(0) === 127) ||
+    baseId === '.' ||
+    baseId === '..' ||
+    !baseId.trim()
+  )
+    throw new Error('Invalid connection ID');
+  if (
+    databaseOverride !== null &&
+    (!databaseOverride.trim() ||
+      /[\\/]/.test(databaseOverride) ||
+      databaseOverride === '.' ||
+      databaseOverride === '..' ||
+      databaseOverride.length > 128)
+  )
+    throw new Error('Invalid database override');
+  return connectionId;
+}
+
+/**
+ * Engines whose "database" is a filesystem path rather than a name on a server.
+ *
+ * The database-override syntax swaps that value straight into the connection,
+ * so on these engines an override does not select a sibling database - it
+ * selects a different file.
+ */
+const FILE_BACKED_DIALECTS = ['sqlite', 'duckdb', 'h2', 'derby', 'access', 'msaccess'];
+
+export function isFileBackedDriver(driver: string | undefined): boolean {
+  const d = (driver ?? '').toLowerCase();
+  return FILE_BACKED_DIALECTS.some((dialect) => d.includes(dialect));
+}
+
+/**
+ * Split an incoming connection identifier into its base ID/name and an optional
+ * database-override component. Returns `databaseOverride: null` when no
+ * override is present.
+ *
+ * Examples:
+ *   "my-conn"                 -> { baseId: "my-conn", databaseOverride: null }
+ *   "my-conn/analytics"       -> { baseId: "my-conn", databaseOverride: "analytics" }
+ *   "postgres-jdbc-abc/orders" -> { baseId: "postgres-jdbc-abc", databaseOverride: "orders" }
+ */
+export function parseConnectionId(connectionId: string): {
+  baseId: string;
+  databaseOverride: string | null;
+} {
+  const slashIdx = connectionId.indexOf('/');
+  if (slashIdx < 0) {
+    return { baseId: connectionId, databaseOverride: null };
+  }
+  const baseId = connectionId.slice(0, slashIdx);
+  const databaseOverride = connectionId.slice(slashIdx + 1);
+  if (!baseId || !databaseOverride) {
+    return { baseId: connectionId, databaseOverride: null };
+  }
+  return { baseId, databaseOverride };
+}
+
+/**
+ * Sanitize SQL identifier (table name, schema name, column name)
+ * Escapes single quotes and validates the identifier
+ */
+export function sanitizeIdentifier(identifier: string): string {
+  if (!identifier || typeof identifier !== 'string') {
+    throw new Error('Identifier must be a non-empty string');
+  }
+
+  // Remove or escape dangerous characters
+  // Allow alphanumeric, underscore, and dots (for schema.table notation)
+  const sanitized = identifier.trim();
+
+  // Check for SQL injection patterns
+  if (/['";\\]/.test(sanitized)) {
+    throw new Error('Identifier contains invalid characters');
+  }
+
+  // Check for suspicious patterns (SQL comments, semicolons)
+  if (/--|\/\*|\*\/|;/.test(sanitized)) {
+    throw new Error('Identifier contains suspicious patterns');
+  }
+
+  // Validate length
+  if (sanitized.length > 128) {
+    throw new Error('Identifier too long (max 128 characters)');
+  }
+
+  // Must start with letter or underscore
+  if (!/^[a-zA-Z_]/.test(sanitized)) {
+    throw new Error('Identifier must start with a letter or underscore');
+  }
+
+  // Only allow safe characters
+  if (!/^[a-zA-Z_][a-zA-Z0-9_]*$/.test(sanitized)) {
+    throw new Error('Identifier contains invalid characters');
+  }
+
+  return sanitized;
+}
+
+/**
+ * Redact sensitive fields from a connection object before returning to clients.
+ * Strips passwords and other credentials to prevent credential leaks.
+ */
+export function redactConnection(conn: Record<string, any>): Record<string, any> {
+  return publicConnection(conn as import('./types.js').DatabaseConnection);
+}
+
+/**
+ * Redact sensitive fields from tool arguments before debug logging.
+ */
+export function redactArgs(args: Record<string, any>): Record<string, any> {
+  const redacted = { ...args };
+  const sensitiveKeys = ['password', 'secret', 'token', 'apikey', 'api_key', 'credential'];
+  for (const key of Object.keys(redacted)) {
+    if (
+      ['query', 'insight'].includes(key.toLowerCase()) ||
+      sensitiveKeys.some((s) => key.toLowerCase().includes(s))
+    ) {
+      redacted[key] = '***REDACTED***';
+    }
+  }
+  return redacted;
+}
+
+/**
+ * Format error messages consistently
+ */
+export function formatError(error: unknown): string {
+  return sanitizeDiagnostic(error);
+}
+
+/**
+ * Get test query based on database driver
+ */
+export function getTestQuery(driver: string): string {
+  const dialect = sqlDialect(driver);
+  const driverLower =
+    dialect === 'postgres' ? 'postgresql' : dialect === 'mssql' ? 'mssql' : driver.toLowerCase();
+
+  if (driverLower.includes('postgresql') || driverLower.includes('postgres')) {
+    return 'SELECT version();';
+  } else if (driverLower.includes('mysql') || driverLower.includes('mariadb')) {
+    return 'SELECT version();';
+  } else if (driverLower.includes('oracle')) {
+    // v$version is granted to PUBLIC, so any session can read it.
+    return 'SELECT banner FROM v$version WHERE ROWNUM = 1';
+  } else if (driverLower.includes('duckdb') || driverLower.includes('clickhouse')) {
+    return 'SELECT version();';
+  } else if (driverLower.includes('sqlite')) {
+    return 'SELECT sqlite_version();';
+  } else if (driverLower.includes('mssql') || driverLower.includes('sqlserver')) {
+    return 'SELECT @@VERSION;';
+  } else if (driverLower.includes('hana') || driverLower.includes('sap')) {
+    return 'SELECT * FROM DUMMY;';
+  } else if (driverLower.includes('db2')) {
+    return 'SELECT 1 FROM SYSIBM.SYSDUMMY1;';
+  } else if (driverLower.includes('mongodb')) {
+    return 'db.version()';
+  } else if (driverLower.includes('redis')) {
+    return 'INFO server';
+  } else {
+    // Generic test query
+    return 'SELECT 1;';
+  }
+}
+
+/**
+ * Column query for an Oracle table, optionally schema-qualified ("OWNER.TABLE").
+ *
+ * all_tab_columns spans every schema the session can see, so a bare name is
+ * pinned to the session's own schema. Each part is validated on its own;
+ * names are stored upper-case unless quoted.
+ */
+function buildOracleSchemaQuery(tableName: string): string {
+  const parts = tableNameParts(tableName);
+  const table = catalogLiteral(parts.at(-1)!, 'oracle');
+  const owner =
+    parts.length === 2
+      ? catalogLiteral(parts[0], 'oracle')
+      : `SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA')`;
+
+  return `
+      SELECT
+        c.column_name,
+        c.data_type,
+        c.nullable,
+        c.data_default,
+        c.data_length,
+        c.data_precision,
+        c.data_scale,
+        CASE WHEN pk.column_name IS NOT NULL THEN 'PRI' END AS column_key
+      FROM all_tab_columns c
+      LEFT JOIN (
+        SELECT cc.owner, cc.table_name, cc.column_name
+        FROM all_constraints k
+        JOIN all_cons_columns cc
+          ON cc.owner = k.owner AND cc.constraint_name = k.constraint_name
+        WHERE k.constraint_type = 'P'
+      ) pk
+        ON pk.owner = c.owner AND pk.table_name = c.table_name AND pk.column_name = c.column_name
+      WHERE c.owner = ${owner}
+        AND c.table_name = ${table}
+      ORDER BY c.column_id;
+    `;
+}
+
+/**
+ * Build schema query based on database driver
+ */
+export function buildSchemaQuery(driver: string, tableName: string): string {
+  const dialect = sqlDialect(driver);
+  const driverLower =
+    dialect === 'postgres' ? 'postgresql' : dialect === 'mssql' ? 'mssql' : driver.toLowerCase();
+  if (driverLower.includes('oracle')) {
+    return buildOracleSchemaQuery(tableName);
+  }
+  const parts = tableNameParts(tableName);
+  const safeTableName = catalogLiteral(parts.at(-1)!, driver);
+  const safeSchema = parts.length === 2 ? catalogLiteral(parts[0], driver) : null;
+
+  if (driverLower.includes('clickhouse')) {
+    return `SELECT name AS column_name,type AS data_type,(startsWith(type,'Nullable(') OR startsWith(type,'LowCardinality(Nullable(')) AS is_nullable,nullIf(default_expression,'') AS column_default FROM system.columns WHERE database=currentDatabase()${safeSchema ? ` AND database=${safeSchema}` : ''} AND table=${safeTableName} ORDER BY position`;
+  }
+  if (driverLower.includes('duckdb')) {
+    return `SELECT column_name,data_type,is_nullable,column_default,character_maximum_length,numeric_precision,numeric_scale FROM duckdb_columns() WHERE database_name=current_database() AND ${duckdbNameEquals('schema_name', safeSchema ?? 'current_schema()')} AND ${duckdbNameEquals('table_name', safeTableName)} ORDER BY column_index`;
+  }
+  if (driverLower.includes('postgresql') || driverLower.includes('postgres')) {
+    return `
+      SELECT
+        column_name,
+        data_type,
+        is_nullable,
+        column_default,
+        character_maximum_length,
+        numeric_precision,
+        numeric_scale
+      FROM information_schema.columns
+      WHERE table_catalog = current_database() AND table_schema = ${safeSchema ?? 'current_schema()'} AND table_name = ${safeTableName}
+      ORDER BY ordinal_position;
+    `;
+  } else if (driverLower.includes('mysql') || driverLower.includes('mariadb')) {
+    return `
+      SELECT
+        COLUMN_NAME as column_name,
+        DATA_TYPE as data_type,
+        IS_NULLABLE as is_nullable,
+        COLUMN_DEFAULT as column_default,
+        CHARACTER_MAXIMUM_LENGTH as character_maximum_length,
+        NUMERIC_PRECISION as numeric_precision,
+        NUMERIC_SCALE as numeric_scale,
+        COLUMN_KEY as column_key,
+        EXTRA as extra
+      FROM information_schema.COLUMNS
+      WHERE ${mysqlNameEquals('TABLE_SCHEMA', safeSchema ?? 'DATABASE()')} AND ${mysqlNameEquals('TABLE_NAME', safeTableName)}
+      ORDER BY ORDINAL_POSITION;
+    `;
+  } else if (driverLower.includes('sqlite')) {
+    return `PRAGMA ${parts.length === 2 ? quoteQualifiedIdentifier(parts[0], driver) + '.' : ''}table_info(${safeTableName});`;
+  } else if (driverLower.includes('mssql') || driverLower.includes('sqlserver')) {
+    return `
+      SELECT
+        COLUMN_NAME as column_name,
+        DATA_TYPE as data_type,
+        IS_NULLABLE as is_nullable,
+        COLUMN_DEFAULT as column_default,
+        CHARACTER_MAXIMUM_LENGTH as character_maximum_length,
+        NUMERIC_PRECISION as numeric_precision,
+        NUMERIC_SCALE as numeric_scale
+      FROM INFORMATION_SCHEMA.COLUMNS
+      WHERE TABLE_CATALOG = DB_NAME() AND TABLE_SCHEMA = ${safeSchema ?? 'SCHEMA_NAME()'} AND TABLE_NAME = ${safeTableName}
+      ORDER BY ORDINAL_POSITION;
+    `;
+  } else {
+    // Generic fallback
+    return `
+      SELECT
+        column_name,
+        data_type,
+        is_nullable,
+        column_default
+      FROM information_schema.columns
+      WHERE table_name = ${safeTableName};
+    `;
+  }
+}
+
+/**
+ * Build list tables query based on database driver
+ */
+export function buildListTablesQuery(
+  driver: string,
+  schema?: string,
+  includeViews: boolean = false
+): string {
+  const dialect = sqlDialect(driver);
+  const driverLower =
+    dialect === 'postgres' ? 'postgresql' : dialect === 'mssql' ? 'mssql' : driver.toLowerCase();
+  const schemaParts = schema ? tableNameParts(schema) : [];
+  if (schemaParts.length > 1) throw new Error('Expected one schema name');
+  const safeSchema = schemaParts.length ? catalogLiteral(schemaParts[0], driver) : null;
+
+  if (driverLower.includes('clickhouse')) {
+    return `SELECT name AS table_name,if(engine LIKE '%View','VIEW','BASE TABLE') AS table_type,database AS table_schema FROM system.tables WHERE database=currentDatabase()${safeSchema ? ` AND database=${safeSchema}` : ''}${includeViews ? '' : ` AND engine NOT LIKE '%View'`} ORDER BY database,name`;
+  }
+  if (driverLower.includes('duckdb')) {
+    const filter = safeSchema ? ` AND ${duckdbNameEquals('schema_name', safeSchema)}` : '';
+    return `SELECT table_name,'BASE TABLE' AS table_type,schema_name AS table_schema FROM duckdb_tables() WHERE NOT internal AND database_name=current_database()${filter}${includeViews ? ` UNION ALL SELECT view_name AS table_name,'VIEW' AS table_type,schema_name AS table_schema FROM duckdb_views() WHERE NOT internal AND database_name=current_database()${filter}` : ''} ORDER BY table_schema,table_name`;
+  }
+  if (driverLower.includes('postgresql') || driverLower.includes('postgres')) {
+    let query = `
+      SELECT
+        table_name,
+        table_type,
+        table_schema
+      FROM information_schema.tables
+      WHERE table_schema NOT IN ('information_schema', 'pg_catalog')
+    `;
+
+    if (safeSchema) {
+      query += ` AND table_schema = ${safeSchema}`;
+    }
+
+    if (!includeViews) {
+      query += ` AND table_type = 'BASE TABLE'`;
+    }
+
+    query += ` ORDER BY table_schema, table_name;`;
+    return query;
+  } else if (driverLower.includes('mysql') || driverLower.includes('mariadb')) {
+    let query = `
+      SELECT
+        TABLE_NAME as table_name,
+        TABLE_TYPE as table_type,
+        TABLE_SCHEMA as table_schema
+      FROM information_schema.TABLES
+      WHERE ${mysqlNameEquals('TABLE_SCHEMA', 'DATABASE()')}
+    `;
+
+    if (safeSchema) {
+      query += ` AND ${mysqlNameEquals('TABLE_SCHEMA', safeSchema)}`;
+    }
+
+    if (!includeViews) {
+      query += ` AND TABLE_TYPE = 'BASE TABLE'`;
+    }
+
+    query += ` ORDER BY TABLE_SCHEMA, TABLE_NAME;`;
+    return query;
+  } else if (driverLower.includes('sqlite')) {
+    const query = `
+      SELECT
+        name as table_name,
+        type as table_type,
+        'main' as table_schema
+      FROM sqlite_master
+      WHERE type IN ('table'${includeViews ? ", 'view'" : ''})
+        AND name NOT LIKE 'sqlite_%'
+      ORDER BY name;
+    `;
+    return query;
+  } else if (driverLower.includes('mssql') || driverLower.includes('sqlserver')) {
+    return `SELECT o.name AS table_name,CASE WHEN o.type='U' THEN 'BASE TABLE' ELSE 'VIEW' END AS table_type,s.name AS table_schema FROM sys.objects o JOIN sys.schemas s ON s.schema_id=o.schema_id WHERE o.is_ms_shipped=0 AND o.type IN (${includeViews ? "'U','V'" : "'U'"})${safeSchema ? ` AND s.name=${safeSchema}` : ''} ORDER BY s.name,o.name`;
+  } else if (driverLower.includes('oracle')) {
+    // Without a schema, skip the schemas Oracle maintains itself (SYS, SYSTEM,
+    // ...): they hold thousands of dictionary tables that would bury the rest.
+    const ownerFilter = safeSchema
+      ? ` WHERE owner = ${safeSchema}`
+      : ` WHERE owner NOT IN (SELECT username FROM all_users WHERE oracle_maintained = 'Y')`;
+
+    let query = `
+      SELECT
+        table_name,
+        'TABLE' as table_type,
+        owner as table_schema
+      FROM all_tables
+    `;
+    query += ownerFilter;
+
+    if (includeViews) {
+      query += `
+        UNION ALL
+        SELECT
+          view_name as table_name,
+          'VIEW' as table_type,
+          owner as table_schema
+        FROM all_views
+      `;
+      query += ownerFilter;
+    }
+
+    query += ` ORDER BY table_schema, table_name`;
+    return query;
+  } else {
+    // Generic fallback
+    let query = `
+      SELECT
+        table_name,
+        table_type,
+        table_schema
+      FROM information_schema.tables
+    `;
+
+    if (safeSchema) {
+      query += ` WHERE table_schema = ${safeSchema}`;
+    }
+
+    if (!includeViews) {
+      query += `${safeSchema ? ' AND' : ' WHERE'} table_type = 'BASE TABLE'`;
+    }
+
+    query += ` ORDER BY table_schema, table_name;`;
+    return query;
+  }
+}
+
+/**
+ * Parse database version from query result
+ */
+export function parseVersionFromResult(result: any): string | undefined {
+  if (!result || !result.rows || result.rows.length === 0) {
+    return undefined;
+  }
+
+  const firstRow = result.rows[0];
+  if (Array.isArray(firstRow) && firstRow.length > 0) {
+    return String(firstRow[0]);
+  } else if (firstRow && typeof firstRow === 'object') {
+    const firstValue = Object.values(firstRow)[0];
+    return firstValue !== undefined ? String(firstValue) : undefined;
+  }
+  return undefined;
+}
+
+/**
+ * Convert query results to CSV format
+ */
+export function convertToCSV(columns: string[], rows: any[][], includeHeaders = true): string {
+  if (rows.length === 0 && !includeHeaders) return '';
+
+  // Create CSV header row
+  let csv = includeHeaders
+    ? columns.map((col) => `"${col.replace(/"/g, '""')}"`).join(',') + '\n'
+    : '';
+
+  // Add data rows
+  rows.forEach((row) => {
+    const values = row.map((val) => {
+      // Handle null/undefined values
+      if (val === null || val === undefined) {
+        return '';
+      }
+
+      // Convert to string and escape quotes
+      const strVal = typeof val === 'object' ? JSON.stringify(val) : String(val);
+      if (
+        strVal.includes(',') ||
+        strVal.includes('"') ||
+        strVal.includes('\n') ||
+        strVal.includes('\r')
+      ) {
+        return `"${strVal.replace(/"/g, '""')}"`;
+      }
+      return strVal;
+    });
+    csv += values.join(',') + '\n';
+  });
+
+  return csv;
+}

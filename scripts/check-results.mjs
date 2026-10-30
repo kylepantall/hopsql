@@ -1,0 +1,188 @@
+import { gunzipSync, brotliDecompressSync, zstdDecompressSync } from 'node:zlib';
+import assert from 'node:assert/strict';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join, resolve } from 'node:path';
+import { execFileSync } from 'node:child_process';
+import { Client } from '@modelcontextprotocol/sdk/client/index.js';
+import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { runJsonCli } from '../dist/runtime/cli.js';
+// CLI versions differ in how they encode BLOBs. Exercise malformed byte streams directly.
+const cliConnection = { id: 'synthetic', name: 'synthetic', driver: 'sqlite', url: '' };
+for (const [program, expected] of [
+  ["process.stdout.write(Buffer.from('5b7b226e223a22ff227d5d','hex'))", /invalid UTF-8/],
+  ['process.stdout.write(\'[{"n":1}\')', /Incomplete database JSON/],
+])
+  await assert.rejects(
+    () => runJsonCli(cliConnection, process.execPath, ['-e', program], 'Fixture CLI', 5000),
+    expected
+  );
+const dir = mkdtempSync(join(tmpdir(), 'hopsql-result-check-'));
+let client;
+try {
+  const db = join(dir, 'fixture.db');
+  execFileSync('sqlite3', [
+    db,
+    "CREATE TABLE messages(id INTEGER PRIMARY KEY,body TEXT); INSERT INTO messages VALUES(1,replace(hex(zeroblob(50000)),'0','x')); INSERT INTO messages VALUES(2,'second');",
+  ]);
+  const file = join(dir, 'config.json');
+  const policyFile = join(dir, 'policy.json');
+  writeFileSync(policyFile, JSON.stringify({ version: 1 }), { mode: 0o600 });
+  writeFileSync(
+    file,
+    JSON.stringify({
+      version: 1,
+      connections: {
+        fixture: {
+          driver: 'sqlite',
+          database: db,
+          policy: { allowTables: ['messages'] },
+          limits: { maxRows: 10, maxBytes: 1048576 },
+        },
+      },
+    }),
+    { mode: 0o600 }
+  );
+  client = new Client({ name: 'hopsql-result-check', version: '1' });
+  await client.connect(
+    new StdioClientTransport({
+      command: process.execPath,
+      args: [resolve('dist/index.js')],
+      stderr: 'pipe',
+      env: {
+        ...process.env,
+        HOPSQL_CONFIG_FILE: file,
+        HOPSQL_POLICY_FILE: policyFile,
+        HOPSQL_WORKSPACE: dir,
+        HOPSQL_ALLOWED_CONNECTIONS: 'fixture',
+        HOPSQL_READ_ONLY: 'true',
+        HOPSQL_DISABLED_TOOLS: '',
+        HOPSQL_UPDATE_NOTIFIER: 'false',
+      },
+    })
+  );
+  const call = async (name, args) => {
+    const response = await client.callTool({ name, arguments: args });
+    assert(!response.isError);
+    return JSON.parse(response.content[0].text);
+  };
+  const result = await call('execute_query', {
+    connectionId: 'fixture',
+    query: 'SELECT * FROM messages',
+  });
+  assert.equal(result.storedRows, 2);
+  assert.equal(result.clippedCells[0].length, 100000);
+  const page = await call('read_result', { resultId: result.resultId, offset: 1, limit: 1 });
+  assert.deepEqual(page.rows, [[2, 'second']]);
+  const cell = await call('read_result_cell', {
+    resultId: result.resultId,
+    row: 0,
+    column: 1,
+    offset: 99000,
+    length: 1000,
+  });
+  assert.equal(cell.text, 'x'.repeat(1000));
+  assert.equal(cell.nextOffset, null);
+  const exported = await call('export_data', {
+    connectionId: 'fixture',
+    query: 'SELECT * FROM messages',
+    format: 'csv',
+    includeHeaders: false,
+  });
+  let data = [],
+    offset = 0;
+  do {
+    const chunk = await call('read_export', { resultId: exported.resultId, offset, length: 48000 });
+    data.push(Buffer.from(chunk.data, 'base64'));
+    offset = chunk.nextOffset;
+  } while (offset !== null);
+  assert.equal(Buffer.concat(data).toString(), '1,' + 'x'.repeat(100000) + '\n2,second\n');
+  const decoders = { gzip: gunzipSync, brotli: brotliDecompressSync, zstd: zstdDecompressSync };
+  const compressedHandles = [];
+  for (const [compression, decompress] of Object.entries(decoders)) {
+    const archive = await call('export_data', {
+      connectionId: 'fixture',
+      query: 'SELECT * FROM messages',
+      format: 'csv',
+      includeHeaders: false,
+      compression,
+    });
+    assert.equal(archive.compression, compression);
+    assert.equal(
+      archive.uncompressedBytes,
+      Buffer.byteLength('1,' + 'x'.repeat(100000) + '\n2,second\n')
+    );
+    assert(archive.bytes < archive.uncompressedBytes);
+    const buffers = [];
+    let next = 0;
+    do {
+      const part = await call('read_export', {
+        resultId: archive.resultId,
+        offset: next,
+        length: 13,
+      });
+      buffers.push(Buffer.from(part.data, 'base64'));
+      next = part.nextOffset;
+    } while (next !== null);
+    assert.equal(
+      decompress(Buffer.concat(buffers)).toString(),
+      '1,' + 'x'.repeat(100000) + '\n2,second\n'
+    );
+    compressedHandles.push(archive.resultId);
+  }
+  await assert.rejects(
+    () =>
+      call('export_data', {
+        connectionId: 'fixture',
+        query: 'SELECT * FROM messages',
+        compression: 'unknown',
+      }),
+    /compression/
+  );
+  await assert.rejects(() => call('read_result', { resultId: '../../etc/passwd' }));
+  await call('append_insight', { connection: 'fixture', insight: 'Synthetic test note' });
+  assert.equal((await call('list_insights', {})).length, 1);
+  writeFileSync(policyFile, JSON.stringify({ version: 1, defaults: { readOnly: true } }));
+  await assert.rejects(
+    () => call('read_result', { resultId: result.resultId }),
+    /access policy changed/
+  );
+  await assert.rejects(
+    () => call('read_export', { resultId: exported.resultId }),
+    /access policy changed/
+  );
+  writeFileSync(policyFile, JSON.stringify({ version: 1 }));
+  // Reusing an ID for another file must not expose data cached from the first one.
+  const originalConfig = readFileSync(file, 'utf8');
+  const otherDb = join(dir, 'other.db');
+  execFileSync('sqlite3', [otherDb, 'CREATE TABLE messages(id INTEGER PRIMARY KEY,body TEXT);']);
+  const repointed = JSON.parse(originalConfig);
+  repointed.connections.fixture.database = otherDb;
+  writeFileSync(file, JSON.stringify(repointed));
+  for (const [name, args] of [
+    ['read_result', { resultId: result.resultId }],
+    ['read_result_cell', { resultId: result.resultId, row: 0, column: 1 }],
+    ['read_export', { resultId: exported.resultId }],
+    ...compressedHandles.map((resultId) => ['read_export', { resultId }]),
+  ])
+    await assert.rejects(() => call(name, args), /connection or access policy changed/);
+  assert(!JSON.stringify(result).includes('connectionFingerprint'));
+  assert(!JSON.stringify(result).includes('policyRevision'));
+  writeFileSync(file, originalConfig);
+  // Revoking a connection table rule also revokes existing handles.
+  writeFileSync(
+    file,
+    JSON.stringify({
+      version: 1,
+      connections: { fixture: { driver: 'sqlite', database: db, policy: { allowTables: [] } } },
+    })
+  );
+  await assert.rejects(() => call('read_result', { resultId: result.resultId }), /policy/);
+  for (const resultId of compressedHandles)
+    await assert.rejects(() => call('read_export', { resultId }), /policy/);
+  assert.equal((await call('list_insights', {})).length, 0);
+  console.log('Stored MCP result pages, long cells, exports, and access revocation passed.');
+} finally {
+  await client?.close();
+  rmSync(dir, { recursive: true, force: true });
+}

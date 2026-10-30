@@ -1,0 +1,33 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+## [1.0.0] - 2026-10-30
+
+First Hopsql release: a fork of [omnisql-mcp](https://github.com/srthkdev/omnisql-mcp) v3.0.0 (commit `5eb6f78`). For changes before the fork, see the [omnisql-mcp changelog](https://github.com/srthkdev/omnisql-mcp/blob/main/CHANGELOG.md).
+
+### Added
+
+- SSH tunnels follow DBeaver jump servers (`jumpServer<N>.*`), dialling each hop through the previous one and verifying every host key.
+- **SSM hops**: an `ssm` block (`target`, `mode`, optional `region`/`profile`) on a configured connection, or under `overrides` for a DBeaver one, reaches bastions without public SSH. `mode: "ssh"` carries the first SSH hop over `AWS-StartSSHSession`; `mode: "port-forward"` uses `AWS-StartPortForwardingSessionToRemoteHost` with no SSH. Expired SSO sessions report the same `aws sso login` hint as IAM auth.
+- **SSH agent discovery**: `HOPSQL_SSH_AUTH_SOCK`, then `SSH_AUTH_SOCK`, then `IdentityAgent` in `~/.ssh/config`, then the 1Password agent socket (Windows: the OpenSSH agent pipe, then Pageant). Key auth also offers agent identities and falls back to the agent when the key file is missing.
+- `dump_table` and `dump_database` tools: SQL dumps via `pg_dump` or `mariadb-dump`/`mysqldump` into the export store (`read_export`), honouring SSH tunnels, TLS mode, table policies, byte caps and timeouts. Missing clients fail with `DUMP_TOOL_MISSING` and an install hint.
+- One-command install from GitHub raw for macOS/Linux (`scripts/install.sh`) and Windows (`scripts/install.ps1`); `--claude` / `-Claude` registers it with Claude Code.
+
+### Changed
+
+- ⚠️ Renamed from OmniSQL: `hopsql` binary, package and MCP entry; `HOPSQL_*` settings; `hopsql:///` resource URIs; `~/.cache/hopsql` and `~/.config/hopsql`. Legacy `OMNISQL_*` variables are still read when the `HOPSQL_*` one is unset, and existing notes under `~/.cache/omnisql-mcp` are kept until a Hopsql notes folder exists. The installers replace a legacy `omnisql` Claude Code entry.
+- `hopsql install <client>` registers the installed launcher, never an npm package.
+- The npm update notifier is opt-in (`HOPSQL_UPDATE_NOTIFIER=true`) and reports upstream omnisql-mcp releases.
+- ⚠️ A dropped SSH/SSM tunnel reopens on its previous local port when free, and pools built on the old tunnel are rebuilt. Read-only queries on tunneled connections retry once after a connection-level failure; writes never retry.
+- ⚠️ PostgreSQL with no `sslmode` (or `prefer`/`allow`) now tries unverified TLS first and falls back to plaintext only if the server has no TLS, matching DBeaver/pgjdbc.
+- ⚠️ `export_data` streams PostgreSQL and MySQL/MariaDB results straight to disk (with streaming compression), capped by the new `HOPSQL_EXPORT_*` settings instead of the per-response byte limit. New `HOPSQL_DUMP_*` and `HOPSQL_ARTIFACT_QUOTA_BYTES` settings.
+
+### Removed
+
+- npm publishing, the documentation website and its deploy workflow (docs now live in [`docs/`](docs/README.md)), and upstream graphics.

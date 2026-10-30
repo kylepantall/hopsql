@@ -1,0 +1,85 @@
+{
+  "mcpServers": {
+    "hopsql": {
+      "command": "/Users/you/.local/bin/hopsql",
+      "env": {
+        "HOPSQL_DEBUG": "false",
+        "HOPSQL_TIMEOUT": "30000"
+      }
+    }
+  },
+  "explanation": {
+    "purpose": "Hopsql MCP configuration for Claude Desktop. Replace the command with the launcher path the installer prints (Windows: \"command\": \"cmd\", \"args\": [\"/c\", \"C:\\\\Users\\\\you\\\\AppData\\\\Local\\\\hopsql\\\\bin\\\\hopsql.cmd\"]).",
+    "features": [
+      "Native query execution for PostgreSQL, MySQL/MariaDB, SQLite, SQL Server",
+      "DBeaver SSH tunnels with jump servers, SSH agents (including 1Password) and AWS SSM hops",
+      "Connection pooling and transaction support",
+      "Query execution plan analysis (EXPLAIN)",
+      "Schema comparison between connections",
+      "Connection whitelisting for access control",
+      "Read-only mode and tool filtering",
+      "Streaming data export to CSV/JSON, and SQL dumps via pg_dump/mysqldump"
+    ],
+    "tools_available": [
+      "list_connections",
+      "get_connection_info",
+      "execute_query",
+      "write_query",
+      "create_table",
+      "alter_table",
+      "drop_table",
+      "get_table_schema",
+      "list_tables",
+      "export_data",
+      "dump_table",
+      "dump_database",
+      "test_connection",
+      "get_database_stats",
+      "begin_transaction",
+      "commit_transaction",
+      "rollback_transaction",
+      "execute_in_transaction",
+      "explain_query",
+      "compare_schemas",
+      "get_pool_stats",
+      "append_insight",
+      "list_insights",
+      "list_databases"
+    ],
+    "environment_variables": {
+      "HOPSQL_WORKSPACE": "Custom workspace path (OS default if not set)",
+      "HOPSQL_PROJECT": "Restrict discovery to one project (default: all projects)",
+      "HOPSQL_TIMEOUT": "Query timeout in milliseconds (default: 30000)",
+      "HOPSQL_DEBUG": "Enable debug logging (true/false)",
+      "HOPSQL_READ_ONLY": "Disable all write operations (true/false)",
+      "HOPSQL_ALLOWED_CONNECTIONS": "Comma-separated whitelist of connection IDs or names",
+      "HOPSQL_DISABLED_TOOLS": "Comma-separated list of tools to disable",
+      "OMNISQL_*": "Legacy names; still accepted when the matching HOPSQL_* variable is unset"
+    },
+    "configuration_examples": {
+      "production": {
+        "command": "/Users/you/.local/bin/hopsql",
+        "env": {
+          "HOPSQL_READ_ONLY": "true",
+          "HOPSQL_ALLOWED_CONNECTIONS": "prod-readonly",
+          "HOPSQL_TIMEOUT": "60000"
+        }
+      },
+      "development": {
+        "command": "/Users/you/.local/bin/hopsql",
+        "env": {
+          "HOPSQL_DEBUG": "true",
+          "HOPSQL_TIMEOUT": "30000"
+        }
+      },
+      "restricted": {
+        "command": "/Users/you/.local/bin/hopsql",
+        "env": {
+          "HOPSQL_READ_ONLY": "true",
+          "HOPSQL_DISABLED_TOOLS": "drop_table,alter_table",
+          "HOPSQL_ALLOWED_CONNECTIONS": "analytics-db,reporting-db"
+        }
+      }
+    }
+  }
+}
