@@ -139,6 +139,38 @@ For bastions without public SSH, add an `ssm` block in `HOPSQL_CONFIG_FILE`: on 
 }
 ```
 
+#### Replacing a port-forward script
+
+A DBeaver connection that points at `localhost` because a script runs `aws ssm start-session` first can be managed by Hopsql instead:
+
+| Setting | Replaces |
+| --- | --- |
+| `ssm.targetName` | Looking up the bastion's instance id by its `Name` tag (re-run on every reconnect) |
+| `ssm.remoteHost` / `ssm.remotePort` | The `host` / `portNumber` the script forwards to |
+| `awsSecret.secretId` | Reading `username` / `password` from Secrets Manager (cached 5 minutes) |
+
+```json
+{
+  "version": 1,
+  "connections": {},
+  "overrides": {
+    "Reporting (prod)": {
+      "ssm": {
+        "targetName": "prod-bastion",
+        "mode": "port-forward",
+        "region": "eu-west-2",
+        "profile": "prod",
+        "remoteHost": "db.proxy.internal",
+        "remotePort": 5432
+      },
+      "awsSecret": { "secretId": "prod/ReportingCluster" }
+    }
+  }
+}
+```
+
+`awsSecret` uses the SSM hop's region and profile unless it sets its own. Use `target` or `targetName`, not both.
+
 SSH tunnels require a matching `known_hosts` entry by default. Verify and record an unknown host fingerprint before connecting. `HOPSQL_SSH_STRICT_HOST_KEY=false` explicitly allows unknown hosts for legacy setups; mismatched and revoked keys remain blocked. A failed tunnel does not fall back to a direct database connection.
 
 Oracle TNS aliases and full descriptors cannot be redirected through the SSH tunnel path and are rejected when combined with it. Use a basic Oracle host/service or host/SID connection for that case.

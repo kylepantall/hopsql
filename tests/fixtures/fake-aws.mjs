@@ -5,6 +5,8 @@
 //    forwards to host:portNumber, and prints the plugin's ready lines.
 // FAKE_AWS_LOG appends each argv as a JSON line; FAKE_AWS_FAIL=sso exits the
 // way the CLI does with an expired SSO session.
+//  - ec2 describe-instances: prints FAKE_AWS_INSTANCE_ID (default i-0fa4e0001).
+//  - secretsmanager get-secret-value: prints FAKE_AWS_SECRET.
 import fs from 'node:fs';
 import net from 'node:net';
 import process from 'node:process';
@@ -15,6 +17,15 @@ if (process.env.FAKE_AWS_LOG) fs.appendFileSync(process.env.FAKE_AWS_LOG, JSON.s
 if (process.env.FAKE_AWS_FAIL === 'sso') {
   process.stderr.write('Error loading SSO Token: Token for example does not exist or has expired\n');
   process.exit(255);
+}
+
+if (args[0] === 'ec2' && args[1] === 'describe-instances') {
+  process.stdout.write(`${process.env.FAKE_AWS_INSTANCE_ID ?? 'i-0fa4e0001'}\n`);
+  process.exit(0);
+}
+if (args[0] === 'secretsmanager' && args[1] === 'get-secret-value') {
+  process.stdout.write(`${process.env.FAKE_AWS_SECRET ?? '{}'}\n`);
+  process.exit(0);
 }
 
 const option = (name) => args[args.indexOf(name) + 1];

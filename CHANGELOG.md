@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- SSM `targetName`: find the bastion by its `Name` tag on every (re)connect.
+- SSM `remoteHost` / `remotePort`: port-forward to a host other than the DBeaver connection's (e.g. one that points at a script's `localhost` forward).
+- `awsSecret`: read `username` / `password` from AWS Secrets Manager.
+
 ## [1.0.0] - 2026-10-30
 
 First Hopsql release: a fork of [omnisql-mcp](https://github.com/srthkdev/omnisql-mcp) v3.0.0 (commit `5eb6f78`). For changes before the fork, see the [omnisql-mcp changelog](https://github.com/srthkdev/omnisql-mcp/blob/main/CHANGELOG.md).

@@ -31,6 +31,8 @@ export interface DatabaseConnection {
   sshTunnel?: SshTunnelConfig;
   /** AWS SSM hop declared in hopsql's own config; DBeaver has no fields for it. */
   ssm?: SsmConfig;
+  /** Secrets Manager secret holding the username and password. */
+  awsSecret?: AwsSecretConfig;
 }
 
 /**
@@ -41,8 +43,27 @@ export interface DatabaseConnection {
  * replaces SSH entirely with `AWS-StartPortForwardingSessionToRemoteHost`.
  */
 export interface SsmConfig {
-  target: string;
+  /** Instance or managed node id. Either this or `targetName` is set. */
+  target?: string;
+  /** `Name` tag of a running instance, looked up on every (re)connect. */
+  targetName?: string;
   mode: 'ssh' | 'port-forward';
+  region?: string;
+  profile?: string;
+  /** Port-forward destination as seen from the instance; defaults to the connection's. */
+  remoteHost?: string;
+  remotePort?: number;
+}
+
+/** An SSM hop whose target has been resolved to an instance id. */
+export type ResolvedSsmConfig = SsmConfig & { target: string };
+
+/**
+ * A Secrets Manager secret in the RDS shape (`username`, `password`). Region
+ * and profile default to the connection's SSM hop.
+ */
+export interface AwsSecretConfig {
+  secretId: string;
   region?: string;
   profile?: string;
 }
@@ -50,6 +71,7 @@ export interface SsmConfig {
 /** Per-connection settings the config file layers onto discovered connections. */
 export interface ConnectionOverride {
   ssm?: SsmConfig;
+  awsSecret?: AwsSecretConfig;
 }
 
 /**

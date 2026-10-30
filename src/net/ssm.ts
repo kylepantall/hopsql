@@ -15,8 +15,14 @@ import fs from 'fs';
 import net from 'net';
 import path from 'path';
 import { Duplex } from 'stream';
-import { awsCliPath, decorateAwsError } from '../auth/iam-auth.js';
-import type { SsmConfig } from '../types.js';
+import {
+  awsCliPath,
+  decorateAwsError,
+  spawnAwsCli,
+  type AwsCommandRunner,
+} from '../auth/iam-auth.js';
+import { registerPrivateValue } from '../privacy.js';
+import type { ResolvedSsmConfig, SsmConfig } from '../types.js';
 
 const STDERR_LIMIT = 8192;
 const READY_LINE = /Waiting for connections|Port \d+ opened/i;
@@ -34,8 +40,44 @@ export interface SsmSession {
   kill(): void;
 }
 
-export function ssmArgs(
+/**
+ * The instance id to start the session on. A `targetName` is looked up each
+ * time, so a replaced bastion is found again on the next reconnect.
+ */
+export async function resolveSsmTarget(
   ssm: SsmConfig,
+  runner: AwsCommandRunner = spawnAwsCli,
+  timeoutMs = 20000
+): Promise<ResolvedSsmConfig> {
+  if (ssm.target) return { ...ssm, target: ssm.target };
+  const args = [
+    'ec2',
+    'describe-instances',
+    '--filters',
+    `Name=tag:Name,Values=${ssm.targetName}`,
+    'Name=instance-state-name,Values=running',
+    '--query',
+    'Reservations[].Instances[].InstanceId',
+    '--output',
+    'text',
+    ...(ssm.region ? ['--region', ssm.region] : []),
+    ...(ssm.profile ? ['--profile', ssm.profile] : []),
+  ];
+  let stdout: string;
+  try {
+    stdout = await runner(args, timeoutMs);
+  } catch (error) {
+    throw decorateAwsError(error, ssm.profile);
+  }
+  const ids = stdout.split(/\s+/).filter((id) => /^i-[0-9a-f]+$/.test(id));
+  if (ids.length === 0) throw new Error('No running instance matches the ssm.targetName Name tag');
+  // Several matches (e.g. mid-replacement) all reach the same network; any will do.
+  registerPrivateValue(ids[0]);
+  return { ...ssm, target: ids[0] };
+}
+
+export function ssmArgs(
+  ssm: ResolvedSsmConfig,
   documentName: string,
   parameters: Record<string, string>
 ): string[] {
@@ -106,7 +148,7 @@ export async function awsInvocation(
   return { ...clientInvocation(resolved, args, platform), verbatim: true };
 }
 
-export async function startSsmSession(ssm: SsmConfig, args: string[]): Promise<SsmSession> {
+export async function startSsmSession(ssm: ResolvedSsmConfig, args: string[]): Promise<SsmSession> {
   const exe = awsCliPath();
   const invocation = await awsInvocation(args);
   const child = spawn(invocation.command, invocation.args, {
@@ -235,7 +277,7 @@ export function ssmDestinationHost(host: string): string {
  * listening. Rejects with the decorated AWS error if the session ends first.
  */
 export async function startSsmPortForward(
-  ssm: SsmConfig,
+  ssm: ResolvedSsmConfig,
   host: string,
   port: number,
   localPort: number,

@@ -21,6 +21,7 @@ import { discoverAgentSocket } from './ssh-agent.js';
 import {
   childStream,
   pickLocalPort,
+  resolveSsmTarget,
   ssmArgs,
   startSsmPortForward,
   startSsmSession,
@@ -257,8 +258,11 @@ export class SshTunnelManager {
       return endpoint(await inFlight);
     }
 
-    const destHost = connection.host || 'localhost';
-    const destPort = connection.port || defaultPort;
+    // A port-forward's remote endpoint replaces DBeaver's, which often points
+    // at a localhost forward a script used to provide.
+    const forward = ssm?.mode === 'port-forward' ? ssm : undefined;
+    const destHost = forward?.remoteHost || connection.host || 'localhost';
+    const destPort = forward?.remotePort || connection.port || defaultPort;
     // A dead tunnel is replaced on the port it had, so anything that cached
     // the endpoint keeps working; the generation still tells pools to rebuild.
     const preferredPort = this.lastPorts.get(key);
@@ -294,7 +298,7 @@ export class SshTunnelManager {
   ): Promise<ActiveTunnel> {
     const localPort = await pickLocalPort(preferredPort);
     const session = await startSsmPortForward(
-      ssm,
+      await resolveSsmTarget(ssm),
       destHost,
       destPort,
       localPort,
@@ -368,9 +372,10 @@ export class SshTunnelManager {
           sock = await this.forwardThrough(previous, hop.host, hop.port, connection.name);
         } else if (connection.ssm?.mode === 'ssh') {
           // ProxyCommand equivalent: the first hop rides on the SSM session.
+          const ssm = await resolveSsmTarget(connection.ssm);
           session = await startSsmSession(
-            connection.ssm,
-            ssmArgs(connection.ssm, 'AWS-StartSSHSession', { portNumber: String(hop.port) })
+            ssm,
+            ssmArgs(ssm, 'AWS-StartSSHSession', { portNumber: String(hop.port) })
           );
           sock = childStream(session.child);
         }

@@ -6,6 +6,7 @@ import path from 'node:path';
 import type { Writable } from 'node:stream';
 import { readConnectionProp } from '../auth/connection-props.js';
 import { isIamAuthConnection, resolveIamCredentials } from '../auth/iam-auth.js';
+import { resolveSecretCredentials } from '../auth/aws-secret.js';
 import { mysqlCliSsl, postgresCliSsl } from '../auth/ssl.js';
 import { clientInvocation } from '../install.js';
 import { sshTunnelManager } from '../net/ssh-tunnel.js';
@@ -300,7 +301,7 @@ export async function resolveDumpTarget(
   const ssl = postgres ? postgresCliSsl(connection, iamAuth) : mysqlCliSsl(connection, iamAuth);
   const iam = iamAuth
     ? await resolveIamCredentials(connection, defaultPort, { debug: options.debug })
-    : undefined;
+    : await resolveSecretCredentials(connection);
   return {
     host: tunnel?.host ?? (connection.host || 'localhost'),
     port: tunnel?.port ?? (connection.port || defaultPort),

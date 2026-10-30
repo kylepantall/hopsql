@@ -153,7 +153,7 @@ export function awsCliPath(): string {
 }
 
 /** Default runner: spawn the AWS CLI with an argument array (never a shell). */
-const spawnAwsCli: AwsCommandRunner = (args, timeoutMs) => {
+export const spawnAwsCli: AwsCommandRunner = (args, timeoutMs) => {
   return new Promise<string>((resolve, reject) => {
     const exe = awsCliPath();
     let proc;

@@ -1,4 +1,9 @@
-import type { ConnectionOverride, DatabaseConnection, SsmConfig } from './types.js';
+import type {
+  AwsSecretConfig,
+  ConnectionOverride,
+  DatabaseConnection,
+  SsmConfig,
+} from './types.js';
 import { validateAccessRule } from './policy/access.js';
 import { readPrivateFile } from './runtime/private-file.js';
 
@@ -16,6 +21,7 @@ const KEYS = [
   'properties',
   'passwordEnv', // Environment variable reference, never a literal credential.
   'ssm',
+  'awsSecret',
 ];
 const LIMITS: Record<string, [number, number]> = {
   maxRows: [1, 100000],
@@ -28,34 +34,82 @@ function object(value: unknown, label: string): Record<string, unknown> {
     throw new Error(`${label} must be an object`);
   return value as Record<string, unknown>;
 }
+const REGION = /^[a-z]{2}(-[a-z]+)+-\d+$/;
+const PROFILE = /^[A-Za-z0-9_][A-Za-z0-9_.+=,@-]{0,127}$/;
+function awsScope(value: Record<string, unknown>, label: string): void {
+  if (
+    value.region !== undefined &&
+    (typeof value.region !== 'string' || !REGION.test(value.region))
+  )
+    throw new Error(`${label}: invalid region`);
+  if (
+    value.profile !== undefined &&
+    (typeof value.profile !== 'string' || !PROFILE.test(value.profile))
+  )
+    throw new Error(`${label}: invalid profile`);
+}
 /**
  * Validate an SSM hop. Every value ends up in the AWS CLI's argv, so none may
- * start with `-` and be read as an option.
+ * start with `-` and be read as an option, and those placed in shorthand
+ * parameters or filters may not contain `,` or `=`.
  */
 export function parseSsm(value: unknown, label: string): SsmConfig {
   const ssm = object(value, `${label}: ssm`);
-  if (Object.keys(ssm).some((k) => !['target', 'mode', 'region', 'profile'].includes(k)))
+  const optional = ['target', 'targetName', 'region', 'profile', 'remoteHost', 'remotePort'];
+  if (Object.keys(ssm).some((k) => k !== 'mode' && !optional.includes(k)))
     throw new Error(`${label}: unknown ssm setting`);
-  if (typeof ssm.target !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9:_./-]{0,255}$/.test(ssm.target))
+  if ((ssm.target === undefined) === (ssm.targetName === undefined))
+    throw new Error(`${label}: set exactly one of ssm.target or ssm.targetName`);
+  if (
+    ssm.target !== undefined &&
+    (typeof ssm.target !== 'string' || !/^[A-Za-z0-9][A-Za-z0-9:_./-]{0,255}$/.test(ssm.target))
+  )
     throw new Error(`${label}: ssm.target must be an instance or managed node id`);
+  if (
+    ssm.targetName !== undefined &&
+    (typeof ssm.targetName !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9 _.:/+@-]{0,254}$/.test(ssm.targetName))
+  )
+    throw new Error(`${label}: ssm.targetName must be a plain instance Name tag`);
   if (ssm.mode !== 'ssh' && ssm.mode !== 'port-forward')
     throw new Error(`${label}: ssm.mode must be "ssh" or "port-forward"`);
+  awsScope(ssm, `${label}: ssm`);
   if (
-    ssm.region !== undefined &&
-    (typeof ssm.region !== 'string' || !/^[a-z]{2}(-[a-z]+)+-\d+$/.test(ssm.region))
+    ssm.remoteHost !== undefined &&
+    (typeof ssm.remoteHost !== 'string' ||
+      !/^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,253}$/.test(ssm.remoteHost))
   )
-    throw new Error(`${label}: invalid ssm.region`);
+    throw new Error(`${label}: ssm.remoteHost must be a plain hostname or IP address`);
   if (
-    ssm.profile !== undefined &&
-    (typeof ssm.profile !== 'string' ||
-      !/^[A-Za-z0-9_][A-Za-z0-9_.+=,@-]{0,127}$/.test(ssm.profile))
+    ssm.remotePort !== undefined &&
+    (!Number.isInteger(ssm.remotePort) ||
+      (ssm.remotePort as number) < 1 ||
+      (ssm.remotePort as number) > 65535)
   )
-    throw new Error(`${label}: invalid ssm.profile`);
+    throw new Error(`${label}: invalid ssm.remotePort`);
+  if ((ssm.remoteHost !== undefined || ssm.remotePort !== undefined) && ssm.mode !== 'port-forward')
+    throw new Error(`${label}: ssm.remoteHost and ssm.remotePort need mode "port-forward"`);
   return {
-    target: ssm.target,
     mode: ssm.mode,
-    ...(ssm.region === undefined ? {} : { region: ssm.region as string }),
-    ...(ssm.profile === undefined ? {} : { profile: ssm.profile as string }),
+    ...Object.fromEntries(optional.filter((k) => ssm[k] !== undefined).map((k) => [k, ssm[k]])),
+  } as SsmConfig;
+}
+/** Validate a Secrets Manager reference; the id is passed as one argv value. */
+export function parseAwsSecret(value: unknown, label: string): AwsSecretConfig {
+  const secret = object(value, `${label}: awsSecret`);
+  if (Object.keys(secret).some((k) => !['secretId', 'region', 'profile'].includes(k)))
+    throw new Error(`${label}: unknown awsSecret setting`);
+  if (
+    typeof secret.secretId !== 'string' ||
+    !/^[A-Za-z0-9/_+=.@:-]{1,2048}$/.test(secret.secretId) ||
+    secret.secretId.startsWith('-')
+  )
+    throw new Error(`${label}: awsSecret.secretId must be a secret name or ARN`);
+  awsScope(secret, `${label}: awsSecret`);
+  return {
+    secretId: secret.secretId,
+    ...(secret.region === undefined ? {} : { region: secret.region as string }),
+    ...(secret.profile === undefined ? {} : { profile: secret.profile as string }),
   };
 }
 function env(name: unknown): string | undefined {
@@ -101,9 +155,14 @@ export function loadConnectionOverrides(
   const result: Record<string, ConnectionOverride> = {};
   for (const [key, value] of Object.entries(overrides)) {
     const entry = object(value, `Override ${key}`);
-    if (Object.keys(entry).some((k) => k !== 'ssm'))
+    if (Object.keys(entry).some((k) => k !== 'ssm' && k !== 'awsSecret'))
       throw new Error(`Unknown setting on override ${key}`);
-    result[key] = entry.ssm === undefined ? {} : { ssm: parseSsm(entry.ssm, `Override ${key}`) };
+    result[key] = {
+      ...(entry.ssm === undefined ? {} : { ssm: parseSsm(entry.ssm, `Override ${key}`) }),
+      ...(entry.awsSecret === undefined
+        ? {}
+        : { awsSecret: parseAwsSecret(entry.awsSecret, `Override ${key}`) }),
+    };
   }
   return result;
 }
@@ -212,6 +271,9 @@ export function loadConfiguredConnections(
       ) as DatabaseConnection['accessRules'],
       limits: limits as DatabaseConnection['limits'],
       ...(entry.ssm === undefined ? {} : { ssm: parseSsm(entry.ssm, `Connection ${id}`) }),
+      ...(entry.awsSecret === undefined
+        ? {}
+        : { awsSecret: parseAwsSecret(entry.awsSecret, `Connection ${id}`) }),
     };
   });
 }

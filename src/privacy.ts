@@ -45,6 +45,9 @@ export function registerConnectionPrivacy(connection: DatabaseConnection): void 
   visit(connection.sshTunnel);
   registerPrivateValue(connection.ssm?.target);
   registerPrivateValue(connection.ssm?.profile);
+  registerPrivateValue(connection.ssm?.targetName);
+  registerPrivateValue(connection.ssm?.remoteHost);
+  registerPrivateValue(connection.awsSecret?.secretId);
   visit(connection.properties);
   // A database selector is public; a file-backed database path is not.
   if (['sqlite', 'duckdb'].includes(sqlDialect(connection.driver ?? 'generic')))

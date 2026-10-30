@@ -12,6 +12,7 @@ import type { Pool as MySqlPool } from 'mysql2/promise';
 import type { ConnectionPool as MssqlPool } from 'mssql';
 import type { DatabaseConnection, PoolConfig, PoolStats } from '../types.js';
 import { isIamAuthConnection, resolveIamCredentials } from '../auth/iam-auth.js';
+import { resolveSecretCredentials } from '../auth/aws-secret.js';
 import { isTunneled, sshTunnelManager, type TunnelEndpoint } from '../net/ssh-tunnel.js';
 import {
   postgresSslNegotiable,
@@ -231,8 +232,10 @@ export class ConnectionPoolManager {
           }
         : resolvedSsl;
 
-    let user = connection.user;
-    let password: string | (() => Promise<string>) | undefined = connection.properties?.password;
+    const secret = await resolveSecretCredentials(connection);
+    let user = secret?.user ?? connection.user;
+    let password: string | (() => Promise<string>) | undefined =
+      secret?.password ?? connection.properties?.password;
 
     if (iamAuth) {
       // Resolve the username once, but hand pg a password *function*: it is
@@ -305,8 +308,9 @@ export class ConnectionPoolManager {
     const iamAuth = isIamAuthConnection(connection);
     const ssl = resolveMysqlSsl(connection, iamAuth);
 
-    let user = connection.user;
-    let password = connection.properties?.password;
+    const secret = await resolveSecretCredentials(connection);
+    let user = secret?.user ?? connection.user;
+    let password = secret?.password ?? connection.properties?.password;
     let authPlugins: mysql.PoolOptions['authPlugins'];
 
     if (iamAuth) {

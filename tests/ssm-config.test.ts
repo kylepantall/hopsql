@@ -46,6 +46,41 @@ describe('SSM connection config', () => {
       ).toThrow();
   });
 
+  it('accepts a Name tag target, a remote endpoint and a credentials secret', () => {
+    const tagged = {
+      targetName: 'prod-bastion',
+      mode: 'port-forward',
+      region: 'eu-west-2',
+      profile: 'prod',
+      remoteHost: 'db.proxy.internal',
+      remotePort: 5432,
+    };
+    const awsSecret = { secretId: 'prod/ReportingCluster' };
+    const overrides = loadConnectionOverrides(
+      configFile({ connections: {}, overrides: { 'reporting-prod': { ssm: tagged, awsSecret } } })
+    );
+    expect(overrides['reporting-prod']).toEqual({ ssm: tagged, awsSecret } as never);
+  });
+
+  it('rejects ambiguous or injectable tag, remote and secret values', () => {
+    const base = { targetName: 'bastion', mode: 'port-forward' };
+    for (const bad of [
+      { ...base, target: 'i-1' },
+      { ...base, targetName: 'a,Values=b' },
+      { ...base, targetName: '-x' },
+      { ...base, remoteHost: 'db,portNumber=22' },
+      { ...base, remotePort: 0 },
+      { ...base, mode: 'ssh', remoteHost: 'db.internal' },
+    ])
+      expect(() =>
+        loadConnectionOverrides(configFile({ overrides: { x: { ssm: bad } } }))
+      ).toThrow();
+    for (const bad of [{ secretId: '--query' }, { secretId: 'a b' }, { secretId: 'a', x: 1 }])
+      expect(() =>
+        loadConnectionOverrides(configFile({ overrides: { x: { awsSecret: bad } } }))
+      ).toThrow();
+  });
+
   it('loads overrides keyed by connection id or name', () => {
     const overrides = loadConnectionOverrides(
       configFile({ connections: {}, overrides: { 'postgres-jdbc-1': { ssm } } })

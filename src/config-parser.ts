@@ -334,7 +334,13 @@ export class WorkspaceConfigParser {
     // regenerating an id only when the user chose to key it by name.
     discovered = discovered.map((c) => {
       const override = overrides[c.id] ?? overrides[c.name];
-      return override?.ssm ? { ...c, ssm: override.ssm } : c;
+      return override
+        ? {
+            ...c,
+            ...(override.ssm ? { ssm: override.ssm } : {}),
+            ...(override.awsSecret ? { awsSecret: override.awsSecret } : {}),
+          }
+        : c;
     });
     const ids = new Set(configured.map((c) => c.id));
     for (const c of discovered) {

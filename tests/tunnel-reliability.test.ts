@@ -9,7 +9,13 @@ import {
   isConnectionLevelError,
   sshTunnelManager,
 } from '../src/net/ssh-tunnel.js';
-import { ssmArgs, awsInvocation, ssmDestinationHost, startSsmPortForward } from '../src/net/ssm.js';
+import {
+  ssmArgs,
+  awsInvocation,
+  ssmDestinationHost,
+  resolveSsmTarget,
+  startSsmPortForward,
+} from '../src/net/ssm.js';
 import { ConnectionPoolManager } from '../src/pools/connection-pool.js';
 import { WorkspaceClient } from '../src/workspace-client.js';
 import { AdapterRegistry } from '../src/runtime/adapter.js';
@@ -324,6 +330,60 @@ describe('SSM sessions', () => {
     },
     20000
   );
+
+  it.skipIf(process.platform === 'win32')(
+    "finds the bastion by Name tag and forwards to the remote host, not DBeaver's localhost",
+    async () => {
+      const logDir = fs.mkdtempSync(path.join(os.tmpdir(), 'hopsql-aws-'));
+      f.cleanups.push(() => fs.rmSync(logDir, { recursive: true, force: true }));
+      const log = path.join(logDir, 'aws.log');
+      setEnv('HOPSQL_AWS_CLI_PATH', FAKE_AWS);
+      setEnv('FAKE_AWS_LOG', log);
+      setEnv('FAKE_AWS_INSTANCE_ID', 'i-0fa4e0002');
+      const dbPort = await startEchoServer(f);
+      const manager = new SshTunnelManager();
+      f.cleanups.push(() => void manager.closeAll());
+      const connection: DatabaseConnection = {
+        id: 'ssm-tagged',
+        name: 'ssm-tagged',
+        driver: 'postgresql',
+        url: '',
+        // What a script-backed DBeaver connection records.
+        host: 'localhost',
+        port: 5432,
+        ssm: {
+          targetName: 'prod-bastion',
+          mode: 'port-forward',
+          remoteHost: '127.0.0.1',
+          remotePort: dbPort,
+        },
+      };
+
+      const endpoint = (await manager.resolveEndpoint(connection, 5432))!;
+      expect(await roundTrip(endpoint.port)).toBe('ping');
+      const calls = fs
+        .readFileSync(log, 'utf8')
+        .trim()
+        .split('\n')
+        .map((line) => JSON.parse(line) as string[]);
+      expect(calls[0].slice(0, 2)).toEqual(['ec2', 'describe-instances']);
+      expect(calls[0]).toContain('Name=tag:Name,Values=prod-bastion');
+      expect(calls[1][calls[1].indexOf('--target') + 1]).toBe('i-0fa4e0002');
+      expect(calls[1][calls[1].indexOf('--parameters') + 1]).toContain(`portNumber=${dbPort}`);
+    },
+    20000
+  );
+
+  it('rejects a Name tag lookup with no running instance', async () => {
+    await expect(
+      resolveSsmTarget({ targetName: 'gone', mode: 'port-forward' }, async () => '\n')
+    ).rejects.toThrow();
+    expect(
+      await resolveSsmTarget({ target: 'i-1', mode: 'ssh' }, async () => {
+        throw new Error('not called');
+      })
+    ).toMatchObject({ target: 'i-1' });
+  });
 
   it.skipIf(process.platform === 'win32')(
     'reports an expired SSO session the way IAM auth does',
