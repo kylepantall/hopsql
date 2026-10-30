@@ -76,7 +76,7 @@ import {
   redactConnection,
 } from './utils.js';
 import { ConnectionPoolManager } from './pools/index.js';
-import { sshTunnelManager } from './net/ssh-tunnel.js';
+import { sshTunnelManager, type HostKeyQuestion } from './net/ssh-tunnel.js';
 import { TransactionManager } from './managers/index.js';
 import { buildExplainQuery, parseExplainOutput } from './utils/query-analyzer.js';
 import { compareSchemas, comparableSchema, generateMigrationScript } from './utils/schema-diff.js';
@@ -2504,6 +2504,29 @@ export class HopsqlMCPServer {
     };
   }
 
+  /** Ask the user, through the MCP client, whether to trust an unknown SSH host key. */
+  private async askToTrustHostKey(question: HostKeyQuestion): Promise<boolean> {
+    const result = await this.server.elicitInput(
+      {
+        message:
+          `Hopsql: SSH host ${question.host}:${question.port} (connection "${question.connectionName}") ` +
+          `is not in known_hosts.\n\n${question.keyType} ${question.fingerprint}\n\n` +
+          'Only trust it if this fingerprint matches one from a source you trust. ' +
+          'Trusting saves it to known_hosts.',
+        requestedSchema: {
+          type: 'object',
+          properties: {
+            trust: { type: 'boolean', title: 'Trust this host key', default: false },
+          },
+          required: ['trust'],
+        },
+      },
+      // The user may need time to check the fingerprint.
+      { timeout: 5 * 60 * 1000 }
+    );
+    return result.action === 'accept' && result.content?.trust === true;
+  }
+
   async run() {
     try {
       // Validate DB client workspace
@@ -2519,6 +2542,11 @@ export class HopsqlMCPServer {
       }
 
       const transport = new StdioServerTransport();
+      this.server.oninitialized = () => {
+        // Only a client that can ask the user gets to approve unknown host keys.
+        if (this.server.getClientCapabilities()?.elicitation)
+          sshTunnelManager.setHostKeyPrompt((question) => this.askToTrustHostKey(question));
+      };
       await this.server.connect(transport);
 
       this.log('Hopsql MCP server started successfully');

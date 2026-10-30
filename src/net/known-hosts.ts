@@ -168,6 +168,28 @@ export function loadKnownHosts(): KnownHostEntry[] {
   }
 }
 
+/**
+ * Record a host key the user approved, the way `ssh` does on first connect.
+ * Values are checked so nothing can add a second line or extra patterns.
+ */
+export function appendKnownHost(host: string, port: number, keyType: string, key: Buffer): void {
+  if (!/^[A-Za-z0-9._:-]+$/.test(host) || !/^[A-Za-z0-9@.-]+$/.test(keyType))
+    throw new Error('SSH host or key type cannot be recorded in known_hosts');
+  const file = knownHostsPath();
+  fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+  let prefix = '';
+  try {
+    const contents = fs.readFileSync(file, 'utf-8');
+    if (contents && !contents.endsWith('\n')) prefix = '\n';
+  } catch {
+    // A missing file is created below.
+  }
+  const pattern = port === 22 ? host : `[${host}]:${port}`;
+  fs.appendFileSync(file, `${prefix}${pattern} ${keyType} ${key.toString('base64')}\n`, {
+    mode: 0o600,
+  });
+}
+
 /** The `SHA256:...` form `ssh` prints, for error messages. */
 export function keyFingerprint(key: Buffer): string {
   return `SHA256:${crypto.createHash('sha256').update(key).digest('base64').replace(/=+$/, '')}`;

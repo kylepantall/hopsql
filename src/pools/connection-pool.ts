@@ -262,7 +262,6 @@ export class ConnectionPoolManager {
       database: connection.database || connection.properties?.database,
       user: user || connection.properties?.user || process.env.PGUSER || 'postgres',
       password: password || process.env.PGPASSWORD,
-      statement_timeout: timeout,
       min: config.min,
       max: config.max,
       idleTimeoutMillis: config.idleTimeoutMs,
@@ -286,6 +285,13 @@ export class ConnectionPoolManager {
         pool as unknown as Parameters<typeof withPostgresSslFallback>[0],
         () => this.log(`PostgreSQL server for ${connection.name} has no TLS; using plaintext`)
       );
+    // Set per session rather than as a startup option, which RDS Proxy rejects
+    // (0A000). pg queues this ahead of any query on the new connection.
+    pool.on('connect', (client) => {
+      client
+        .query(`SET statement_timeout = ${Math.max(0, Math.floor(timeout))}`)
+        .catch((error: Error) => this.log(`Could not set statement_timeout: ${error.message}`));
+    });
     pool.on('error', (error) => this.log(`Idle PostgreSQL connection error: ${error.message}`));
     const entry: PoolEntry = {
       pool,

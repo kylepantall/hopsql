@@ -108,3 +108,12 @@ describe('Postgres sslmode=prefer semantics', () => {
     expect(pool.options.ssl).toMatchObject({ rejectUnauthorized: false });
   });
 });
+
+describe('Postgres statement timeout', () => {
+  it('is set per session, not as a startup option RDS Proxy rejects', async () => {
+    const { pool } = await connectVia('N', { sslmode: 'disable' });
+    const options = (pool as unknown as { options: Record<string, unknown> }).options;
+    expect(options.statement_timeout).toBeUndefined();
+    expect(pool.listenerCount('connect')).toBe(1);
+  });
+});

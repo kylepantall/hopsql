@@ -16,7 +16,13 @@ import net from 'net';
 import os from 'os';
 import path from 'path';
 import type { DatabaseConnection, SshTunnelConfig, SsmConfig } from '../types.js';
-import { keyFingerprint, knownHostsPath, loadKnownHosts, verifyHostKey } from './known-hosts.js';
+import {
+  appendKnownHost,
+  keyFingerprint,
+  knownHostsPath,
+  loadKnownHosts,
+  verifyHostKey,
+} from './known-hosts.js';
 import { discoverAgentSocket } from './ssh-agent.js';
 import {
   childStream,
@@ -200,7 +206,37 @@ export function buildConnectOptions(
   return { ...base, agent };
 }
 
+/** An SSH host that is not in known_hosts, refused under strict checking. */
+export class UnknownHostKeyError extends Error {
+  constructor(
+    message: string,
+    readonly host: string,
+    readonly port: number,
+    readonly keyType: string,
+    readonly key: Buffer
+  ) {
+    super(message);
+  }
+}
+
+export interface HostKeyQuestion {
+  connectionName: string;
+  host: string;
+  port: number;
+  keyType: string;
+  fingerprint: string;
+}
+
+/** Asks the user whether to trust an unknown host key; true records it. */
+export type HostKeyPrompt = (question: HostKeyQuestion) => Promise<boolean>;
+
+/** Each hop of a chain can be unknown, so allow one approval per plausible hop. */
+const MAX_HOST_KEY_APPROVALS = 8;
+
 export class SshTunnelManager {
+  private hostKeyPrompt: HostKeyPrompt | undefined;
+  /** One question per host key, however many connections hit it at once. */
+  private hostKeyQuestions = new Map<string, Promise<boolean>>();
   private tunnels = new Map<string, ActiveTunnel>();
   private pending = new Map<string, Promise<ActiveTunnel>>();
   /** The last local port per connection, rebound on reconnect when free. */
@@ -218,6 +254,57 @@ export class SshTunnelManager {
    */
   setDebug(debug: boolean): void {
     this.debug = debug;
+  }
+
+  /** Set once the MCP client says it can ask the user; unset, unknown hosts are refused. */
+  setHostKeyPrompt(prompt: HostKeyPrompt | undefined): void {
+    this.hostKeyPrompt = prompt;
+  }
+
+  /**
+   * Open the tunnel, asking the user about each unknown host key on the way.
+   * An approved key is recorded and the chain is dialled again from the start.
+   */
+  private async openWithApproval(
+    connection: DatabaseConnection,
+    config: SshTunnelConfig | undefined,
+    destHost: string,
+    destPort: number,
+    preferredPort?: number
+  ): Promise<ActiveTunnel> {
+    for (let approvals = 0; ; approvals += 1) {
+      try {
+        return await this.open(connection, config, destHost, destPort, preferredPort);
+      } catch (error) {
+        const prompt = this.hostKeyPrompt;
+        if (
+          !(error instanceof UnknownHostKeyError) ||
+          !prompt ||
+          approvals >= MAX_HOST_KEY_APPROVALS
+        )
+          throw error;
+        const fingerprint = keyFingerprint(error.key);
+        const id = `${error.host}:${error.port}:${error.keyType}:${fingerprint}`;
+        let question = this.hostKeyQuestions.get(id);
+        if (!question) {
+          question = prompt({
+            connectionName: connection.name,
+            host: error.host,
+            port: error.port,
+            keyType: error.keyType,
+            fingerprint,
+          })
+            .then((trusted) => {
+              if (trusted) appendKnownHost(error.host, error.port, error.keyType, error.key);
+              return trusted;
+            })
+            .finally(() => this.hostKeyQuestions.delete(id));
+          this.hostKeyQuestions.set(id, question);
+        }
+        if (!(await question)) throw error;
+        this.log(`Recorded approved host key for ${error.host}:${error.port} (${fingerprint})`);
+      }
+    }
   }
 
   private log(message: string): void {
@@ -273,7 +360,7 @@ export class SshTunnelManager {
       if (existing) await existing.close().catch(() => {});
       return ssm?.mode === 'port-forward'
         ? this.openPortForward(connection, ssm, destHost, destPort, preferredPort)
-        : this.open(connection, config, destHost, destPort, preferredPort);
+        : this.openWithApproval(connection, config, destHost, destPort, preferredPort);
     })();
     this.pending.set(key, creation);
     try {
@@ -502,10 +589,14 @@ export class SshTunnelManager {
             }
 
             if (strict) {
-              hostKeyError = new Error(
+              hostKeyError = new UnknownHostKeyError(
                 `SSH host ${config.host}:${config.port} is not in ${knownHostsPath()} and ` +
                   `strict verification is enabled. Its key is ${keyFingerprint(key)}; connect ` +
-                  `once with ssh, verify the fingerprint through a trusted source, and record it, then retry.`
+                  `once with ssh, verify the fingerprint through a trusted source, and record it, then retry.`,
+                config.host,
+                config.port,
+                detectKeyType(key),
+                key
               );
               callback(false);
               return;

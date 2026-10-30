@@ -7,6 +7,8 @@ import path from 'node:path';
 import { Server as SshServer, utils as sshUtils } from 'ssh2';
 import {
   SshTunnelManager,
+  UnknownHostKeyError,
+  type HostKeyQuestion,
   buildConnectOptions,
   detectKeyType,
   expandHome,
@@ -379,6 +381,58 @@ describe('SshTunnelManager end to end', () => {
     } finally {
       if (saved !== undefined) process.env.HOPSQL_SSH_STRICT_HOST_KEY = saved;
     }
+  });
+
+  describe('approving unknown host keys', () => {
+    const unknownHost = (sshPort: number): DatabaseConnection => ({
+      id: `approve-${sshPort}`,
+      name: 'Approve',
+      driver: 'postgres',
+      url: '',
+      host: 'localhost',
+      sshTunnel: {
+        enabled: true,
+        host: '127.0.0.1',
+        port: sshPort,
+        user: 'test',
+        authType: 'PASSWORD',
+        password: 'synthetic-fixture',
+      },
+    });
+
+    it('records an approved key once, then connects without asking again', async () => {
+      const sshPort = await startSshServer(false);
+      const questions: HostKeyQuestion[] = [];
+      const manager = new SshTunnelManager();
+      cleanups.push(() => void manager.closeAll());
+      manager.setHostKeyPrompt(async (question) => {
+        questions.push(question);
+        return true;
+      });
+      const connection = unknownHost(sshPort);
+      expect(await manager.resolveEndpoint(connection, 5432)).not.toBeNull();
+      expect(questions).toHaveLength(1);
+      expect(questions[0]).toMatchObject({ host: '127.0.0.1', port: sshPort });
+      expect(questions[0].fingerprint).toMatch(/^SHA256:/);
+      const recorded = fs.readFileSync(process.env.HOPSQL_SSH_KNOWN_HOSTS!, 'utf8');
+      expect(recorded.startsWith(`[127.0.0.1]:${sshPort} `)).toBe(true);
+
+      // A fresh manager with no prompt now trusts the recorded key.
+      const fresh = new SshTunnelManager();
+      cleanups.push(() => void fresh.closeAll());
+      expect(await fresh.resolveEndpoint(connection, 5432)).not.toBeNull();
+    });
+
+    it('refuses a declined key and records nothing', async () => {
+      const sshPort = await startSshServer(false);
+      const manager = new SshTunnelManager();
+      cleanups.push(() => void manager.closeAll());
+      manager.setHostKeyPrompt(async () => false);
+      await expect(manager.resolveEndpoint(unknownHost(sshPort), 5432)).rejects.toBeInstanceOf(
+        UnknownHostKeyError
+      );
+      expect(fs.readFileSync(process.env.HOPSQL_SSH_KNOWN_HOSTS!, 'utf8')).toBe('');
+    });
   });
 
   it('should forward traffic to the target seen from the SSH server', async () => {
