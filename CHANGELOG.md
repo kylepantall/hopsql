@@ -7,10 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.2.0] - 2026-11-02
+
 ### Added
 
+- `hopsql doctor [--json] [--strict]`: reports `sqlite3`, `duckdb`, `pg_dump`, `mysqldump`/`mariadb-dump`, `aws` and `session-manager-plugin` (found with version and path, or missing with an install command for this OS), marking the ones your connections need as required. The installers run it at the end and never fail on it.
 - `HOPSQL_UPDATE_GITHUB_URL` / `HOPSQL_UPDATE_RAW_URL`: point update checks and installer downloads at a mirror.
 - CI covers ask approvals inside transactions (Postgres, MySQL, MariaDB, SQL Server) and the approval-gated update flow end to end.
+
+### Fixed
+
+- Dump client versions come from `Ver` / `Distrib`, not the last number printed (`for macos26.6` was read as the version), so the newest client is picked correctly.
+- An unknown override setting now says to restart the MCP server: a server started before an update rejects settings the newer `hopsql` wrote.
 
 ## [1.1.0] - 2026-11-02
 

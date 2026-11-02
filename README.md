@@ -58,6 +58,7 @@ DuckDB uses an installed CLI so its native binary stays out of the npm package. 
 
 - macOS, Linux or Windows. The installer provides Bun 1.4.3+ if you don't have it; the built server also runs on Node.js 22.15+ or 24+.
 - A database connection or an existing DBeaver-compatible workspace
+- Per feature, a few command-line tools; `hopsql doctor` shows which you have and need
 - For `dump_*` tools: `pg_dump` (`brew install libpq` / `winget install PostgreSQL.PostgreSQL`) or `mariadb-dump`/`mysqldump` (`brew install mariadb-connector-c` or `mysql-client` / `winget install MariaDB.Server`)
 
 ## Quick setup
@@ -184,6 +185,7 @@ Pass `saveToFile: true` to write the dump to a new owner-only file in the dump f
 | `hopsql query <conn> --file report.sql` | Runs one statement from a `.sql`/`.psql`/`.pgsql`/`.mysql`/`.ddl`/`.dml` file (max 1 MiB) through `execute_query`, with the same policy and JSON output. Inline SQL works too: `hopsql query <conn> "SELECT 1"` |
 | `hopsql query <conn> --write --file fix.sql` | The same through `write_query`; needs `HOPSQL_READ_ONLY=false` and a writable connection |
 | `hopsql exec <conn> -- psql -c 'select 1'` | Runs a local tool with the connection's credentials in its environment (`PG*` or `MYSQL_HOST`/`MYSQL_TCP_PORT`/`MYSQL_USER`/`MYSQL_PWD`, plus `DATABASE_URL`), through the same SSH/SSM tunnel |
+| `hopsql doctor` | Lists the command-line tools Hopsql uses (`sqlite3`, `duckdb`, `pg_dump`, `mysqldump`/`mariadb-dump`, `aws`, `session-manager-plugin`): found with version, or missing with the install command for your OS. Tools your connections need are marked required; `--strict` exits 1 if one is missing, `--json` for scripts. The installers run it at the end |
 | `hopsql update` | Checks GitHub for a newer release and reruns the installer for it (`--check` only reports, `--yes` skips the prompt, `--json` for scripts) |
 
 The CLI reads the same `HOPSQL_*` variables as the server, so export `HOPSQL_CONFIG_FILE` (and any allowlist) in your shell if your MCP entry sets them.

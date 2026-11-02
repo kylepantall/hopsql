@@ -198,6 +198,10 @@ main() {
     info 'Added "hopsql" (user scope). Start a new Claude session to load it.'
   fi
 
+  # Report only: missing database clients or the AWS CLI never fail the install.
+  step 'Checking command-line tools'
+  "$bin_dir/hopsql" doctor 2>&1 | sed 's/^/    /' || true
+
   printf '\n✓ Hopsql installed: %s/hopsql\n' "$bin_dir"
   [[ "$register_claude" == true ]] || printf '  Register it with: %s/hopsql install claude\n' "$bin_dir"
   case ":$PATH:" in

@@ -82,6 +82,8 @@ try {
     HOPSQL_WORKSPACE: join(temp, 'workspace'),
     HOPSQL_PROJECT: 'Custom',
     HOPSQL_READ_ONLY: 'true',
+    // Never the developer's own `hopsql access` settings, which outrank the ceiling.
+    HOPSQL_OVERRIDES_FILE: join(temp, 'overrides.json'),
     HOPSQL_ALLOWED_CONNECTIONS: '',
     HOPSQL_DISABLED_TOOLS: '',
     HOPSQL_DEBUG: 'false',

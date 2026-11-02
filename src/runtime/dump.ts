@@ -129,10 +129,15 @@ export function dumpToolVersion(file: string): number[] | null {
       shell: false,
       windowsHide: true,
     });
-    // mysqldump prints "Ver 8.0.36" or "Distrib 10.11.6-MariaDB"; take the last.
-    const matches = [...String(result.stdout ?? '').matchAll(/(\d+)\.(\d+)(?:\.(\d+))?/g)];
-    const last = matches.at(-1);
-    if (last) version = last.slice(1).filter(Boolean).map(Number);
+    // MariaDB's real version follows "Distrib", MySQL's follows "Ver"; pg_dump
+    // has only one. Never the last number: "for macos26.6" would win.
+    const output = String(result.stdout ?? '');
+    const number = /(\d+)\.(\d+)(?:\.(\d+))?/;
+    const match =
+      new RegExp('Distrib ' + number.source).exec(output) ??
+      new RegExp('Ver ' + number.source).exec(output) ??
+      number.exec(output);
+    if (match) version = match.slice(1).filter(Boolean).map(Number);
   } catch {
     // Unrunnable: reported as unknown.
   }

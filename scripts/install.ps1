@@ -216,6 +216,14 @@ function Install-Hopsql {
       Write-Info 'Added "hopsql" (user scope). Start a new Claude session to load it.'
     }
 
+    # Report only: missing database clients or the AWS CLI never fail the install.
+    Write-Step 'Checking command-line tools'
+    try {
+      & $launcher doctor 2>&1 | ForEach-Object { Write-Info "$_" }
+    } catch {
+      Write-Info 'Tool check skipped; run "hopsql doctor" later.'
+    }
+
     Write-Host "`nHopsql installed: $launcher"
     if (-not $Claude) { Write-Host "  Register it with: `"$launcher`" install claude" }
     $userPath = [Environment]::GetEnvironmentVariable('Path', 'User')

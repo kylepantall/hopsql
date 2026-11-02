@@ -58,6 +58,7 @@ import {
 import { validateToolArguments } from './policy/arguments.js';
 import { validateStatement } from './policy/sql.js';
 import { checkForUpdate, getUpdateStatus, installLocation, runUpdate } from './update-check.js';
+import { RECONNECT_HINT, installedEntry, isStale, refreshServers } from './refresh.js';
 import { WorkspaceConfigParser } from './config-parser.js';
 import {
   loadManagedOverrides,
@@ -431,6 +432,64 @@ export class HopsqlMCPServer {
     };
     process.on('SIGTERM', shutdown);
     process.on('SIGINT', shutdown);
+    // `hopsql refresh` and the refresh tool recycle current servers in place.
+    if (process.platform !== 'win32')
+      process.on('SIGHUP', () => {
+        this.recycle().catch((error) => this.log(`Recycle failed: ${formatError(error)}`, 'error'));
+      });
+  }
+
+  /**
+   * Drop pooled connections, tunnels and cached workspace connections so the
+   * next call reconnects with current configuration and credentials. Skipped
+   * while transactions are open, since closing their pools would abort them.
+   */
+  private async recycle(): Promise<{ recycled: boolean; openTransactions: number }> {
+    const openTransactions = this.transactionManager.getActiveTransactions().length;
+    if (openTransactions > 0) return { recycled: false, openTransactions };
+    await this.poolManager.closeAllPools();
+    // After the pools, so nothing is still using a forward when it closes.
+    await sshTunnelManager.closeAll();
+    this.configParser.clearCache();
+    this.refreshNotes();
+    this.log('Recycled pools, tunnels and caches');
+    return { recycled: true, openTransactions };
+  }
+
+  /** The `refresh` tool: the same as `hopsql refresh`, then this server recycles too. */
+  private async handleRefresh() {
+    const others = refreshServers();
+    const self = await this.recycle();
+    let installedVersion: string | null = null;
+    let outdated = false;
+    try {
+      installedVersion = JSON.parse(
+        fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8')
+      ).version;
+      const startedAt = new Date(Date.now() - process.uptime() * 1000);
+      outdated = isStale({ pid: process.pid, startedAt }, installedEntry().builtAt);
+    } catch {
+      /* Not an installed layout; nothing newer to compare with. */
+    }
+    const restartRequired = outdated || (installedVersion !== null && installedVersion !== VERSION);
+    let connections: number | null = null;
+    let error: string | undefined;
+    try {
+      connections = (await this.getFilteredConnections()).length;
+    } catch (cause) {
+      error = formatError(cause);
+    }
+    return {
+      runningVersion: VERSION,
+      installedVersion,
+      restartRequired,
+      ...(restartRequired ? { restart: RECONNECT_HINT } : {}),
+      recycled: self.recycled,
+      openTransactions: self.openTransactions,
+      otherServers: others,
+      connections,
+      ...(error ? { error } : {}),
+    };
   }
 
   private setupResourceHandlers() {
@@ -637,6 +696,12 @@ export class HopsqlMCPServer {
         name: 'check_for_update',
         description:
           'Check GitHub for a newer Hopsql release. When one is available, offer the user to install it with update_hopsql or by running "hopsql update"',
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'refresh',
+        description:
+          'Recycle Hopsql: drop pooled connections, tunnels and cached configuration so the next call reconnects with current settings and credentials; recycle other running Hopsql servers and stop ones older than the installed version. Call it when connections fail after a config or credential change or an update. If restartRequired is true, ask the user to reconnect the MCP server',
         inputSchema: { type: 'object', properties: {} },
       },
       {
@@ -1111,7 +1176,7 @@ export class HopsqlMCPServer {
       tool.annotations = {
         readOnlyHint:
           !WRITE_TOOLS.includes(tool.name) &&
-          !['append_insight', 'update_hopsql'].includes(tool.name),
+          !['append_insight', 'update_hopsql', 'refresh'].includes(tool.name),
         destructiveHint: WRITE_TOOLS.includes(tool.name),
         openWorldHint: true,
       };
@@ -1261,6 +1326,9 @@ export class HopsqlMCPServer {
 
           case 'update_hopsql':
             return this.toolResult(await this.handleUpdate());
+
+          case 'refresh':
+            return this.toolResult(await this.handleRefresh());
 
           case 'create_table':
             return await this.handleCreateTable(
