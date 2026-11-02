@@ -11,6 +11,7 @@ import {
   installLocation,
   isNewerVersion,
   runUpdate,
+  updateHosts,
   updateRepository,
 } from '../src/update-check.js';
 afterEach(() => restoreEnv());
@@ -88,6 +89,33 @@ describe('update checks', () => {
       await expect(fetchLatestRelease({ cacheDir, fetch: odd, env: {} })).rejects.toThrow();
     });
     expect(() => updateRepository({ HOPSQL_REPO: '../evil' })).toThrow();
+  });
+
+  it('uses override hosts for mirrors and fixtures, keeping the cache per host', async () => {
+    expect(updateHosts({})).toEqual({
+      web: 'https://github.com',
+      raw: 'https://raw.githubusercontent.com',
+    });
+    expect(
+      updateHosts({
+        HOPSQL_UPDATE_GITHUB_URL: 'http://127.0.0.1:8123/',
+        HOPSQL_UPDATE_RAW_URL: 'https://mirror.example.test',
+      })
+    ).toEqual({ web: 'http://127.0.0.1:8123', raw: 'https://mirror.example.test' });
+    for (const value of ['file:///etc', 'https://example.test/path', 'https://x.test/?q', 'nope'])
+      expect(() => updateHosts({ HOPSQL_UPDATE_GITHUB_URL: value })).toThrow();
+
+    await withCache(async (cacheDir) => {
+      const fetcher = vi.fn().mockImplementation(async () => release('v1.0.0'));
+      const mirror = { HOPSQL_UPDATE_GITHUB_URL: 'http://127.0.0.1:8123' };
+      const latest = await fetchLatestRelease({ cacheDir, fetch: fetcher, env: mirror });
+      expect(fetcher.mock.calls[0][0]).toBe(
+        'http://127.0.0.1:8123/kylepantall/hopsql/releases/latest'
+      );
+      expect(latest?.url.startsWith('http://127.0.0.1:8123/')).toBe(true);
+      await fetchLatestRelease({ cacheDir, fetch: fetcher, env: {} });
+      expect(fetcher).toHaveBeenCalledTimes(2);
+    });
   });
 
   it('notifies on stderr by default and stays quiet when disabled or offline', async () => {
