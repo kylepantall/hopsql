@@ -36,6 +36,8 @@ jobs:
         run: bun scripts/check-privacy.mjs && node scripts/check-privacy.mjs
       - name: Check live access modes, ask approvals and exec on both runtimes
         run: bun scripts/check-access.mjs && node scripts/check-access.mjs
+      - name: Check the approval-gated update flow on both runtimes
+        run: bun scripts/check-update.mjs && node scripts/check-update.mjs
       - name: Verify packed npm CLI on both runtimes
         run: bun scripts/check-package.mjs && node scripts/check-package.mjs
       - run: bun audit --audit-level=high
