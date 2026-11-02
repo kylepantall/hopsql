@@ -12,6 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `hopsql doctor [--json] [--strict]`: reports `sqlite3`, `duckdb`, `pg_dump`, `mysqldump`/`mariadb-dump`, `aws` and `session-manager-plugin` (found with version and path, or missing with an install command for this OS), marking the ones your connections need as required. The installers run it at the end and never fail on it.
+- `hopsql refresh` and the `refresh` tool: recycle running servers in place (pools, tunnels, cached config) and stop ones older than the installed build, so clients start the new version on reconnect.
+- `hopsql exec` on `ask` connections asks once per run, showing the connection and command: in the terminal, or a desktop dialog when a model runs it without one. It is still refused for read-only connections.
 - `HOPSQL_UPDATE_GITHUB_URL` / `HOPSQL_UPDATE_RAW_URL`: point update checks and installer downloads at a mirror.
 - CI covers ask approvals inside transactions (Postgres, MySQL, MariaDB, SQL Server) and the approval-gated update flow end to end.
 

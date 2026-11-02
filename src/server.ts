@@ -2802,14 +2802,14 @@ export class HopsqlMCPServer {
   /**
    * A saved connection for `hopsql exec`, under the same allowlist and access
    * policy as the tools. Raw credentials bypass the SQL policy, so read-only
-   * connections are refused.
+   * connections are refused; `ask` connections are approved by runExec.
    */
   async connectionForExec(connectionId: string, database?: string): Promise<DatabaseConnection> {
     const connection = await this.getConnection(sanitizeConnectionId(connectionId), database);
     if (!connection) throw new Error(`Connection not found: ${connectionId}`);
-    if (this.accessPolicy.isReadOnly(connection) || connection.askBeforeWrite)
+    if (this.accessPolicy.isReadOnly(connection))
       throw new Error(
-        'This connection is read-only or asks before writes in Hopsql; injected credentials would bypass that. Make it writable with "hopsql access writable <connection>" to use exec.'
+        'This connection is read-only in Hopsql; injected credentials would bypass that. Use "hopsql access ask <connection>" (approve each run) or "writable" to use exec.'
       );
     return connection;
   }
