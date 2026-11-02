@@ -58,6 +58,7 @@ DuckDB uses an installed CLI so its native binary stays out of the npm package. 
 
 - macOS, Linux or Windows. The installer provides Bun 1.4.3+ if you don't have it; the built server also runs on Node.js 22.15+ or 24+.
 - A database connection or an existing DBeaver-compatible workspace
+- Per feature, a few command-line tools; `hopsql doctor` shows which you have and need
 - For `dump_*` tools: `pg_dump` (`brew install libpq` / `winget install PostgreSQL.PostgreSQL`) or `mariadb-dump`/`mysqldump` (`brew install mariadb-connector-c` or `mysql-client` / `winget install MariaDB.Server`)
 
 ## Quick setup
@@ -169,7 +170,7 @@ hopsql access read-only --all
 hopsql access reset staging                  # back to the connection's default
 ```
 
-`ask` prompts in the MCP client for each `write_query`, `create_table`, `alter_table`, `drop_table` and write statement in a transaction, showing the SQL. An approval covers that one call only. Clients that can't prompt are refused, and so are `hopsql query --write` and `hopsql exec`. A model that has a shell can run `hopsql access` itself, so `ask` protects against MCP-only clients, not a model with terminal access. MCP clients start Hopsql with piped stdio, so they still get the server; `hopsql serve` forces it in a terminal.
+`ask` prompts in the MCP client for each `write_query`, `create_table`, `alter_table`, `drop_table` and write statement in a transaction, showing the SQL. An approval covers that one call only. Clients that can't prompt are refused, and so is `hopsql query --write`. `hopsql exec` asks once per run instead (see below). A model that has a shell can run `hopsql access` itself, so `ask` protects against MCP-only clients, not a model with terminal access. MCP clients start Hopsql with piped stdio, so they still get the server; `hopsql serve` forces it in a terminal.
 
 ### Dumps
 
@@ -184,11 +185,13 @@ Pass `saveToFile: true` to write the dump to a new owner-only file in the dump f
 | `hopsql query <conn> --file report.sql` | Runs one statement from a `.sql`/`.psql`/`.pgsql`/`.mysql`/`.ddl`/`.dml` file (max 1 MiB) through `execute_query`, with the same policy and JSON output. Inline SQL works too: `hopsql query <conn> "SELECT 1"` |
 | `hopsql query <conn> --write --file fix.sql` | The same through `write_query`; needs `HOPSQL_READ_ONLY=false` and a writable connection |
 | `hopsql exec <conn> -- psql -c 'select 1'` | Runs a local tool with the connection's credentials in its environment (`PG*` or `MYSQL_HOST`/`MYSQL_TCP_PORT`/`MYSQL_USER`/`MYSQL_PWD`, plus `DATABASE_URL`), through the same SSH/SSM tunnel |
+| `hopsql doctor` | Lists the command-line tools Hopsql uses (`sqlite3`, `duckdb`, `pg_dump`, `mysqldump`/`mariadb-dump`, `aws`, `session-manager-plugin`): found with version, or missing with the install command for your OS. Tools your connections need are marked required; `--strict` exits 1 if one is missing, `--json` for scripts. The installers run it at the end |
 | `hopsql update` | Checks GitHub for a newer release and reruns the installer for it (`--check` only reports, `--yes` skips the prompt, `--json` for scripts) |
+| `hopsql refresh` | Recycles running MCP servers (pooled connections, tunnels and cached config dropped; the next call reconnects) and stops ones older than the installed build, so clients start the new version on reconnect. The `refresh` tool lets a model do the same. macOS and Linux |
 
 The CLI reads the same `HOPSQL_*` variables as the server, so export `HOPSQL_CONFIG_FILE` (and any allowlist) in your shell if your MCP entry sets them.
 
-`exec` is for PostgreSQL and MySQL/MariaDB connections. It refuses read-only connections, because raw credentials bypass Hopsql's SQL policy. Model-driven shells get piped output, so the password is masked there as `********`. It still stops accidental leaks only: a command that deliberately encodes the password could get it out.
+`exec` is for PostgreSQL and MySQL/MariaDB connections. It refuses read-only connections, because raw credentials bypass Hopsql's SQL policy. On `ask` connections it asks you first, showing the connection and the full command: in the terminal when there is one, otherwise in a desktop dialog (macOS dialog, `zenity`/`kdialog` on Linux, a Windows message box). One approval covers the whole run, since Hopsql can't see the statements the command sends. With no terminal and no desktop, it refuses. Model-driven shells get piped output, so the password is masked there as `********`. It still stops accidental leaks only: a command that deliberately encodes the password could get it out.
 
 `execute_query` and `write_query` take a `file` path instead of `query` too, so a model can run a SQL file without pasting it.
 
@@ -343,6 +346,7 @@ PostgreSQL, MySQL/MariaDB, and SQL Server support explicit transactions. Results
 - `list_insights` - Retrieve stored notes
 - `check_for_update` - Compare this install with the latest GitHub release
 - `update_hopsql` - Install the latest release after the user confirms in the client
+- `refresh` - Drop pooled connections, tunnels and cached config; recycle other servers and stop outdated ones
 
 ## Security
 

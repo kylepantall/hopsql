@@ -46,9 +46,19 @@ if (process.argv[2] === 'install') {
   process.exit(0);
 }
 
-if (['update', 'query', 'exec', 'access'].includes(process.argv[2])) {
+if (['update', 'query', 'exec', 'access', 'doctor', 'refresh'].includes(process.argv[2])) {
   const args = process.argv.slice(3);
   try {
+    if (process.argv[2] === 'refresh') {
+      const { runRefresh } = await import('./refresh.js');
+      await runRefresh(args);
+      process.exit(0);
+    }
+    if (process.argv[2] === 'doctor') {
+      const { runDoctor } = await import('./doctor.js');
+      const { loadConnections } = await import('./manage.js');
+      process.exit(await runDoctor(args, loadConnections));
+    }
     if (process.argv[2] === 'access') {
       const { runAccessCommand } = await import('./manage.js');
       await runAccessCommand(args);
@@ -84,6 +94,9 @@ Usage: hopsql                 Manage connections (in a terminal; MCP clients get
        hopsql manage          Turn connections read-only, set up SSM hops and secrets
        hopsql serve [options] Run the MCP server even in a terminal
        hopsql install [claude|codex|opencode] [--config <file> | --workspace <directory>] [--allow <ids>] [--allow-writes] [--dry-run]
+       hopsql refresh         Recycle running MCP servers (pools, tunnels, caches); stop ones older than this install
+       hopsql doctor [--json] [--strict]
+                              Check the command-line tools your connections need (sqlite3, pg_dump, aws, ...)
        hopsql access [<read-only|ask|writable|reset> (<connection>... | --all)]
                               List or bulk-change write access; running servers apply it on the next call
        hopsql query <connection> (<sql> | --file <query.sql>) [--write] [--database <name>] [--max-rows <n>]

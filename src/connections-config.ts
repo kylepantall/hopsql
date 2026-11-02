@@ -163,7 +163,11 @@ export function loadConnectionOverrides(
   for (const [key, value] of Object.entries(overrides)) {
     const entry = object(value, `Override ${key}`);
     if (Object.keys(entry).some((k) => !['ssm', 'awsSecret', 'readOnly', 'access'].includes(k)))
-      throw new Error(`Unknown setting on override ${key}`);
+      // Kept strict: ignoring a setting could drop a restriction. Usually this is
+      // a server older than the hopsql that wrote the file.
+      throw new Error(
+        `Unknown setting on override ${key}. If a newer hopsql wrote it, restart this MCP server (run "hopsql update" first if needed).`
+      );
     if (entry.readOnly !== undefined && typeof entry.readOnly !== 'boolean')
       throw new Error(`Override ${key}: readOnly must be true or false`);
     if (entry.access !== undefined && !WRITE_ACCESS_MODES.includes(entry.access as WriteAccess))

@@ -8,6 +8,7 @@
 
 import { spawn } from 'node:child_process';
 import type { Writable } from 'node:stream';
+import { askUser, type Approver } from './approval.js';
 import { sshTunnelManager } from './net/ssh-tunnel.js';
 import { dumpFlavorFor, resolveDumpTarget } from './runtime/dump.js';
 import type { DatabaseConnection, DumpFlavor, DumpTarget } from './types.js';
@@ -113,12 +114,28 @@ export function parseExecArgs(argv: string[]): ExecArgs {
 
 export async function runExec(
   argv: string[],
-  resolveConnection: (id: string, database?: string) => Promise<DatabaseConnection>
+  resolveConnection: (id: string, database?: string) => Promise<DatabaseConnection>,
+  approve: Approver = askUser
 ): Promise<number> {
   const parsed = parseExecArgs(argv);
   const connection = await resolveConnection(parsed.connectionId, parsed.database);
   const flavor = dumpFlavorFor(connection.driver);
   if (!flavor) throw new Error('exec supports PostgreSQL and MySQL/MariaDB connections');
+  if (connection.askBeforeWrite) {
+    // Before any tunnel opens or token is minted. The command gets the raw
+    // credentials, so this approves the whole run, not single statements.
+    const shown = [parsed.command, ...parsed.args].join(' ');
+    const approved = await approve(
+      `Allow this command to use the credentials for "${connection.name}"?\n\n` +
+        `${shown.length > 2000 ? shown.slice(0, 2000) + ' …' : shown}\n\n` +
+        'It gets full access to the database for this run; Hopsql cannot check what it does.'
+    );
+    if (approved === null)
+      throw new Error(
+        'This connection asks before writes and there is no terminal or desktop dialog to ask in. Make it writable with "hopsql access writable <connection>" to use exec.'
+      );
+    if (!approved) throw new Error('The user did not approve this command');
+  }
   const target = await resolveDumpTarget(connection, flavor);
   const injected = connectionEnv(target, flavor);
   const secrets = target.password

@@ -157,7 +157,7 @@ async function promptAccess(
   );
 }
 
-async function loadConnections(): Promise<DatabaseConnection[]> {
+export async function loadConnections(): Promise<DatabaseConnection[]> {
   const workspacePath = process.env.HOPSQL_WORKSPACE || findWorkspaces()[0];
   const parser = new WorkspaceConfigParser({ workspacePath });
   return parser.parseConnections();

@@ -202,10 +202,9 @@ try {
     `process.exit(process.env.PGPASSWORD === ${JSON.stringify(password)} ? 7 : 1)`
   );
   assert.equal(check.status, 7, 'exec must inject the real password');
-  for (const mode of ['ask', 'read-only']) {
-    access(mode, 'pg');
-    assert.notEqual(cli('exec', 'pg', '--', process.execPath, '-e', '').status, 0);
-  }
+  // ask asks in a terminal or desktop dialog (unit-tested); this would open a real one.
+  access('read-only', 'pg');
+  assert.notEqual(cli('exec', 'pg', '--', process.execPath, '-e', '').status, 0);
 
   console.log(
     'Access modes: live changes, list_changed, ask approvals, SQL files, query CLI and exec masking passed.'

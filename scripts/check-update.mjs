@@ -12,6 +12,7 @@ import {
   realpathSync,
   rmSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from 'node:fs';
 import { createServer } from 'node:http';
@@ -83,10 +84,14 @@ async function connect(entry, elicitation) {
         ? { action: 'accept', content: { install: true } }
         : { action: 'decline' };
     });
-  await client.connect(
-    new StdioClientTransport({ command: process.execPath, args: [entry], env, stderr: 'ignore' })
-  );
-  return { client, state };
+  const transport = new StdioClientTransport({
+    command: process.execPath,
+    args: [entry],
+    env,
+    stderr: 'ignore',
+  });
+  await client.connect(transport);
+  return { client, state, pid: transport.pid };
 }
 const refused = async (client, name) => {
   try {
@@ -122,7 +127,7 @@ try {
   rmSync(marker);
 
   // A client that cannot ask the user is refused before any download.
-  const { client: mute } = await connect(installed, false);
+  const { client: mute, pid: mutePid } = await connect(installed, false);
   clients.push(mute);
   assert.equal(await refused(mute, 'update_hopsql'), true);
 
@@ -151,8 +156,46 @@ try {
   assert.equal((await cli('--yes')).status, 0);
   assert.equal(readFileSync(marker, 'utf8').split('|')[0], tag);
 
+  // refresh: a newer build lands while servers run. The refresh tool stops the
+  // outdated ones and recycles itself; `hopsql refresh` recycles current ones.
+  if (process.platform !== 'win32') {
+    const alive = (pid) => {
+      try {
+        process.kill(pid, 0);
+        return true;
+      } catch {
+        return false;
+      }
+    };
+    const pause = (ms) => new Promise((done) => setTimeout(done, ms));
+    await pause(1200);
+    utimesSync(installed, new Date(), new Date());
+    await pause(1200);
+    // An outdated server says it needs a restart rather than claiming to be current.
+    const outdated = (await mute.callTool({ name: 'refresh', arguments: {} })).structuredContent;
+    assert.equal(outdated.restartRequired, true);
+    const { client: current, pid: currentPid } = await connect(installed, false);
+    clients.push(current);
+    const refreshed = (await current.callTool({ name: 'refresh', arguments: {} }))
+      .structuredContent;
+    assert.equal(refreshed.restartRequired, false);
+    assert.equal(refreshed.recycled, true);
+    assert(refreshed.otherServers.stopped.includes(mutePid), 'Outdated servers are stopped');
+    for (let i = 0; i < 50 && alive(mutePid); i++) await pause(100);
+    assert.equal(alive(mutePid), false);
+    const recycledByCli = await new Promise((done) =>
+      execFile(process.execPath, [installed, 'refresh'], { env, timeout: 30000 }, (error) =>
+        done(error ? 1 : 0)
+      )
+    );
+    assert.equal(recycledByCli, 0);
+    assert.equal(alive(currentPid), true, 'Current servers are recycled, not stopped');
+    const after = await current.callTool({ name: 'list_connections', arguments: {} });
+    assert.notEqual(after.isError, true);
+  }
+
   console.log(
-    'Update flow: release check, approval-gated install, refusals and CLI update passed.'
+    'Update flow: release check, approval-gated install, refusals, CLI update and refresh passed.'
   );
 } finally {
   for (const client of clients) await client.close().catch(() => {});

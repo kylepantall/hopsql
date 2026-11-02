@@ -174,6 +174,11 @@ export class WorkspaceConfigParser {
   private workspaceCache?: { signature: string; connections: DatabaseConnection[] };
   private pendingWorkspace?: Promise<DatabaseConnection[]>;
 
+  /** Forget parsed workspace connections so the next lookup reads them again. */
+  clearCache(): void {
+    this.workspaceCache = undefined;
+  }
+
   constructor(config: WorkspaceConfig = {}) {
     const workspacePath = config.workspacePath ?? this.getDefaultWorkspacePath();
     registerPrivateValue(workspacePath);

@@ -6,6 +6,7 @@ import {
   DumpError,
   createDumpFile,
   dumpDirectory,
+  dumpToolVersion,
   findDumpCandidates,
   resolveDumpBinary,
 } from '../src/runtime/dump.js';
@@ -49,6 +50,19 @@ describe.skipIf(process.platform === 'win32')('dump client discovery', () => {
     fakeTool(root, 'mysqldump', 'mysqldump  Ver 8.4.0 for macos');
     expect(findDumpCandidates('mariadb', { PATH: root }, 'darwin', [])[0].path).toBe(maria);
     expect(resolveDumpBinary('mariadb', { PATH: root }).path).toBe(maria);
+  });
+
+  it('reads the client version, not a number from the platform name', () => {
+    const root = tempDir();
+    const cases: [string, number[]][] = [
+      ['mysqldump  Ver 26.10.0 for macos26.6 on arm64 (Homebrew)', [26, 10, 0]],
+      ['mysqldump  Ver 10.19 Distrib 10.11.6-MariaDB, for osx10.20 (arm64)', [10, 11, 6]],
+      ['pg_dump (PostgreSQL) 18.6 (Homebrew)', [18, 6]],
+    ];
+    for (const [i, [line, expected]] of cases.entries()) {
+      const tool = fakeTool(path.join(root, String(i)), 'mysqldump', line);
+      expect(dumpToolVersion(tool)).toEqual(expected);
+    }
   });
 
   it('round-trips pinned tools and the dump folder in the managed file', () => {
