@@ -7,7 +7,8 @@ These tool definitions were exported from the Hopsql server. The tables below de
 - `connectionId` accepts a saved connection ID or name.
 - An optional `database` selects a database on the same server for supported tools.
 - Queries must use the syntax of the target database.
-- `execute_query` accepts a single read-only statement. Use `write_query` for permitted writes.
+- `execute_query` accepts a single read-only statement. Use `write_query` for permitted writes. Both take `file` (a `.sql`/`.psql`/`.pgsql`/`.mysql`/`.ddl`/`.dml` path, max 1 MiB) instead of `query`.
+- `check_for_update` compares the install with the latest GitHub release; `update_hopsql` installs it once the user confirms in the client.
 - Transaction tools require a supported pooled driver and are disabled in read-only mode.
 - Schema migration scripts are returned as text; schema comparison does not apply them.
 

@@ -11,10 +11,11 @@ mock.module('@clack/prompts', () => ({
   cancel: vi.fn(),
   log: { step: vi.fn(), success: vi.fn(), message: vi.fn(), error: vi.fn(), warn: vi.fn() },
   select: prompt,
+  multiselect: prompt,
   text: prompt,
   isCancel: (value: unknown) => typeof value === 'symbol',
 }));
-import { awsProfiles, runManage } from '../src/manage.js';
+import { awsProfiles, runAccessCommand, runManage } from '../src/manage.js';
 import { WorkspaceConfigParser } from '../src/config-parser.js';
 import {
   loadManagedOverrides,
@@ -47,6 +48,12 @@ function fixture() {
           driver: 'postgres-jdbc',
           configuration: { host: 'localhost', port: '5432', database: 'reports' },
         },
+        'pg-2': {
+          name: 'Billing',
+          provider: 'postgresql',
+          driver: 'postgres-jdbc',
+          configuration: { host: 'localhost', port: '5432', database: 'billing' },
+        },
       },
     })
   );
@@ -56,21 +63,80 @@ function fixture() {
   setEnv('HOPSQL_CONFIG_FILE', undefined);
   setEnv('AWS_CONFIG_FILE', path.join(dir, 'no-aws-config'));
   setEnv('AWS_SHARED_CREDENTIALS_FILE', path.join(dir, 'no-aws-credentials'));
-  const parse = async () =>
-    (await new WorkspaceConfigParser({ workspacePath: workspace }).parseConnections())[0];
-  return { dir, overrides, parse };
+  const parseAll = async () =>
+    new WorkspaceConfigParser({ workspacePath: workspace }).parseConnections();
+  const parse = async () => (await parseAll()).find((c) => c.id === 'pg-1')!;
+  return { dir, overrides, parse, parseAll };
 }
 
 describe('hopsql manage', () => {
-  it('toggles read-only and the running server sees it on the next lookup', async () => {
+  it('sets access and the running server sees it on the next lookup', async () => {
     const { overrides, parse } = fixture();
     expect((await parse()).readonly).toBe(false);
-    answers.push('pg-1', 'readOnly', '');
+    answers.push('pg-1', 'access', 'read-only', '');
     await runManage();
     expect(answers).toHaveLength(0);
-    expect(loadManagedOverrides(overrides)['pg-1']).toEqual({ readOnly: true });
-    expect((await parse()).readonly).toBe(true);
+    expect(loadManagedOverrides(overrides)['pg-1']).toEqual({ access: 'read-only' });
+    expect(await parse()).toMatchObject({ readonly: true, accessManaged: true });
     expect(fs.statSync(overrides).mode & 0o077).toBe(0);
+
+    answers.push('pg-1', 'access', 'ask', '');
+    await runManage();
+    expect(await parse()).toMatchObject({ readonly: false, askBeforeWrite: true });
+
+    answers.push('pg-1', 'access', 'reset', '');
+    await runManage();
+    const reset = await parse();
+    expect(reset.readonly).toBe(false);
+    expect(reset.accessManaged).toBeUndefined();
+  });
+
+  it('changes several connections at once from the menu', async () => {
+    const { overrides, parseAll } = fixture();
+    answers.push('\0bulk', ['pg-1', 'pg-2'], 'ask', '');
+    await runManage();
+    expect(answers).toHaveLength(0);
+    expect(loadManagedOverrides(overrides)).toEqual({
+      'pg-1': { access: 'ask' },
+      'pg-2': { access: 'ask' },
+    });
+    expect((await parseAll()).every((c) => c.askBeforeWrite)).toBe(true);
+  });
+
+  it('hopsql access changes connections by id or name, or all of them', async () => {
+    const { overrides } = fixture();
+    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+    try {
+      await runAccessCommand(['writable', 'pg-1', 'Billing']);
+      expect(loadManagedOverrides(overrides)).toEqual({
+        'pg-1': { access: 'writable' },
+        'pg-2': { access: 'writable' },
+      });
+      await runAccessCommand(['read-only', '--all']);
+      expect(
+        Object.values(loadManagedOverrides(overrides)).every((o) => o.access === 'read-only')
+      ).toBe(true);
+      await runAccessCommand([]);
+      expect(stdout).toHaveBeenCalled();
+    } finally {
+      stdout.mockRestore();
+    }
+  });
+
+  it('hopsql access changes nothing when a connection is unknown or the mode is invalid', async () => {
+    const { overrides } = fixture();
+    await expect(runAccessCommand(['writable', 'pg-1', 'nope'])).rejects.toThrow();
+    await expect(runAccessCommand(['sometimes', 'pg-1'])).rejects.toThrow();
+    await expect(runAccessCommand(['writable'])).rejects.toThrow();
+    expect(fs.existsSync(overrides)).toBe(false);
+  });
+
+  it('migrates the older readOnly key when access is set', async () => {
+    const { overrides, parse } = fixture();
+    saveManagedOverrides({ 'pg-1': { readOnly: true } }, overrides);
+    expect(await parse()).toMatchObject({ readonly: true, accessManaged: true });
+    await runAccessCommand(['ask', 'pg-1']);
+    expect(loadManagedOverrides(overrides)['pg-1']).toEqual({ access: 'ask' });
   });
 
   it('sets up an SSM hop with a Secrets Manager login, then removes it', async () => {
@@ -133,11 +199,11 @@ describe('hopsql manage', () => {
   it('sets the dump folder without losing connection overrides', async () => {
     const { dir, overrides } = fixture();
     const folder = path.join(dir, 'dumps');
-    answers.push('pg-1', 'readOnly', '\0tools', 'folder', folder, '', '');
+    answers.push('pg-1', 'access', 'read-only', '\0tools', 'folder', folder, '', '');
     await runManage();
     expect(answers).toHaveLength(0);
     expect(loadManagedSettings(overrides).dumpDirectory).toBe(folder);
-    expect(loadManagedOverrides(overrides)['pg-1']).toEqual({ readOnly: true });
+    expect(loadManagedOverrides(overrides)['pg-1']).toEqual({ access: 'read-only' });
   });
 
   it('lists AWS profiles from config and credentials, skipping sso-session blocks', () => {

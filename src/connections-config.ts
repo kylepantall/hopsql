@@ -4,7 +4,9 @@ import type {
   DatabaseConnection,
   ManagedSettings,
   SsmConfig,
+  WriteAccess,
 } from './types.js';
+import { WRITE_ACCESS_MODES } from './types.js';
 import { validateAccessRule } from './policy/access.js';
 import fs from 'node:fs';
 import { homedir } from 'node:os';
@@ -160,12 +162,17 @@ export function loadConnectionOverrides(
   const result: Record<string, ConnectionOverride> = {};
   for (const [key, value] of Object.entries(overrides)) {
     const entry = object(value, `Override ${key}`);
-    if (Object.keys(entry).some((k) => !['ssm', 'awsSecret', 'readOnly'].includes(k)))
+    if (Object.keys(entry).some((k) => !['ssm', 'awsSecret', 'readOnly', 'access'].includes(k)))
       throw new Error(`Unknown setting on override ${key}`);
     if (entry.readOnly !== undefined && typeof entry.readOnly !== 'boolean')
       throw new Error(`Override ${key}: readOnly must be true or false`);
+    if (entry.access !== undefined && !WRITE_ACCESS_MODES.includes(entry.access as WriteAccess))
+      throw new Error(`Override ${key}: access must be ${WRITE_ACCESS_MODES.join(', ')}`);
+    if (entry.access !== undefined && entry.readOnly !== undefined)
+      throw new Error(`Override ${key}: set access or readOnly, not both`);
     result[key] = {
       ...(entry.readOnly === undefined ? {} : { readOnly: entry.readOnly }),
+      ...(entry.access === undefined ? {} : { access: entry.access as WriteAccess }),
       ...(entry.ssm === undefined ? {} : { ssm: parseSsm(entry.ssm, `Override ${key}`) }),
       ...(entry.awsSecret === undefined
         ? {}
@@ -263,17 +270,35 @@ export function saveManagedSettings(
   writeManagedFile(loadManagedOverrides(file), settings, file);
 }
 
-/** Layer an override onto a connection; later settings win. */
+/** The write mode an override sets, if any; `readOnly` is the older spelling. */
+export function overrideAccess(override: ConnectionOverride | undefined): WriteAccess | undefined {
+  if (override?.access) return override.access;
+  if (override?.readOnly !== undefined) return override.readOnly ? 'read-only' : 'writable';
+  return undefined;
+}
+
+/**
+ * Layer an override onto a connection; later settings win. `managed` marks the
+ * `hopsql manage` file, whose access setting outranks HOPSQL_READ_ONLY=true.
+ */
 export function applyOverride(
   connection: DatabaseConnection,
-  override: ConnectionOverride | undefined
+  override: ConnectionOverride | undefined,
+  managed = false
 ): DatabaseConnection {
   if (!override) return connection;
+  const access = overrideAccess(override);
   return {
     ...connection,
     ...(override.ssm ? { ssm: override.ssm } : {}),
     ...(override.awsSecret ? { awsSecret: override.awsSecret } : {}),
-    ...(override.readOnly === undefined ? {} : { readonly: override.readOnly }),
+    ...(access === undefined
+      ? {}
+      : {
+          readonly: access === 'read-only',
+          askBeforeWrite: access === 'ask',
+          accessManaged: managed,
+        }),
   };
 }
 

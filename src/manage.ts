@@ -8,7 +8,17 @@
 import fs from 'node:fs';
 import { homedir } from 'node:os';
 import { join } from 'node:path';
-import { cancel, intro, isCancel, log, note, outro, select, text } from '@clack/prompts';
+import {
+  cancel,
+  intro,
+  isCancel,
+  log,
+  multiselect,
+  note,
+  outro,
+  select,
+  text,
+} from '@clack/prompts';
 import { WorkspaceConfigParser, findWorkspaces } from './config-parser.js';
 import { isAbsolute } from 'node:path';
 import {
@@ -21,7 +31,14 @@ import {
   saveManagedSettings,
 } from './connections-config.js';
 import { dumpDirectory, findDumpCandidates, type DumpCandidate } from './runtime/dump.js';
-import type { ConnectionOverride, DatabaseConnection, DumpFlavor, SsmConfig } from './types.js';
+import type {
+  ConnectionOverride,
+  DatabaseConnection,
+  DumpFlavor,
+  SsmConfig,
+  WriteAccess,
+} from './types.js';
+import { WRITE_ACCESS_MODES } from './types.js';
 
 function answer<T>(value: T | symbol): T {
   if (isCancel(value)) {
@@ -52,6 +69,10 @@ export function awsProfiles(home = homedir(), env = process.env): string[] {
   return [...names].sort();
 }
 
+export function accessOf(c: DatabaseConnection): WriteAccess {
+  return c.readonly ? 'read-only' : c.askBeforeWrite ? 'ask' : 'writable';
+}
+
 /** One line per connection: the state that matters at a glance. */
 export function describeConnection(c: DatabaseConnection): string {
   const transport = c.ssm ? `SSM ${c.ssm.mode}` : c.sshTunnel?.enabled ? 'SSH' : 'direct';
@@ -59,9 +80,81 @@ export function describeConnection(c: DatabaseConnection): string {
     c.name,
     c.driver,
     transport,
-    c.readonly ? 'read-only' : 'writable',
+    // Only managed settings outrank a server started with HOPSQL_READ_ONLY=true.
+    c.accessManaged ? accessOf(c) : `${accessOf(c)} (default)`,
     ...(c.awsSecret ? ['secret'] : []),
   ].join(' · ');
+}
+
+/**
+ * Set the access mode of several connections in one write of the managed
+ * file; `reset` drops the setting so the connection's own default applies.
+ * Running servers read the file on every call, so this needs no restart.
+ */
+export function setAccess(
+  connections: DatabaseConnection[],
+  access: WriteAccess | 'reset',
+  file = managedOverridesPath()
+): void {
+  const overrides = loadManagedOverrides(file);
+  for (const connection of connections) {
+    // Keep an existing entry keyed by name; the server matches id first, then name.
+    const key =
+      !overrides[connection.id] && overrides[connection.name] ? connection.name : connection.id;
+    const next: ConnectionOverride = { ...overrides[key] };
+    delete next.readOnly;
+    if (access === 'reset') delete next.access;
+    else next.access = access;
+    overrides[key] = next;
+  }
+  saveManagedOverrides(overrides, file);
+}
+
+const ACCESS_USAGE =
+  'Usage: hopsql access                                  List connections and their access\n' +
+  '       hopsql access <read-only|ask|writable|reset> (<connection>... | --all)';
+
+/** `hopsql access`: list or bulk-change connection access from scripts or a model's shell. */
+export async function runAccessCommand(args: string[]): Promise<void> {
+  const connections = await loadConnections();
+  const say = (line: string) => process.stdout.write(line + '\n');
+  if (args.length === 0) {
+    for (const c of connections) say(`${c.id}\t${describeConnection(c)}`);
+    return;
+  }
+  const [mode, ...targets] = args;
+  if (![...WRITE_ACCESS_MODES, 'reset'].includes(mode) || targets.length === 0)
+    throw new Error(ACCESS_USAGE);
+  let chosen: DatabaseConnection[];
+  if (targets.includes('--all')) {
+    if (targets.length > 1) throw new Error(ACCESS_USAGE);
+    chosen = connections;
+  } else {
+    const missing = targets.filter((t) => !connections.some((c) => c.id === t || c.name === t));
+    if (missing.length)
+      throw new Error(`Unknown connections: ${missing.join(', ')}. Nothing changed.`);
+    chosen = connections.filter((c) => targets.includes(c.id) || targets.includes(c.name));
+  }
+  setAccess(chosen, mode as WriteAccess | 'reset');
+  say(`${chosen.length} connection(s) set to ${mode}. Running servers apply it on the next call.`);
+}
+
+async function promptAccess(
+  message: string,
+  current?: WriteAccess
+): Promise<WriteAccess | 'reset'> {
+  return answer(
+    await select<WriteAccess | 'reset'>({
+      message,
+      initialValue: current,
+      options: [
+        { value: 'read-only', label: 'Read-only', hint: 'writes refused' },
+        { value: 'ask', label: 'Ask', hint: 'approve each write in the client' },
+        { value: 'writable', label: 'Writable', hint: 'writes allowed' },
+        { value: 'reset', label: 'Default', hint: "the connection's own setting" },
+      ],
+    })
+  );
 }
 
 async function loadConnections(): Promise<DatabaseConnection[]> {
@@ -289,6 +382,9 @@ export async function runManage(): Promise<void> {
         message: 'Choose a connection',
         options: [
           ...connections.map((c) => ({ value: c.id, label: describeConnection(c) })),
+          ...(connections.length > 1
+            ? [{ value: '\0bulk', label: 'Change access for several connections' }]
+            : []),
           { value: '\0tools', label: 'Dump tools and folder' },
           { value: '', label: 'Done' },
         ],
@@ -299,6 +395,23 @@ export async function runManage(): Promise<void> {
       await manageDumpTools();
       continue;
     }
+    if (chosen === '\0bulk') {
+      const ids = answer(
+        await multiselect({
+          message: 'Connections to change (space to select)',
+          options: connections.map((c) => ({ value: c.id, label: describeConnection(c) })),
+          required: true,
+        })
+      );
+      const access = await promptAccess(`Access for ${ids.length} connection(s)`);
+      setAccess(
+        connections.filter((c) => ids.includes(c.id)),
+        access,
+        file
+      );
+      log.success(`${ids.length} connection(s) set to ${access}`);
+      continue;
+    }
     const connection = connections.find((c) => c.id === chosen)!;
     const overrides = loadManagedOverrides(file);
     const existing = overrides[connection.id] ?? {};
@@ -307,8 +420,9 @@ export async function runManage(): Promise<void> {
         message: connection.name,
         options: [
           {
-            value: 'readOnly',
-            label: connection.readonly ? 'Allow writes' : 'Make read-only',
+            value: 'access',
+            label: `Access: ${accessOf(connection)}`,
+            hint: 'read-only, ask before each write, or writable',
           },
           {
             value: 'ssm',
@@ -323,24 +437,25 @@ export async function runManage(): Promise<void> {
       })
     );
     if (!action) continue;
+    if (action === 'access') {
+      const access = await promptAccess(connection.name, accessOf(connection));
+      setAccess([connection], access, file);
+      log.success(`${connection.name}: ${access}`);
+      continue;
+    }
     let next: ConnectionOverride;
-    if (action === 'readOnly') next = { ...existing, readOnly: !connection.readonly };
-    else if (action === 'ssm') next = await promptSsm(connection, existing);
+    if (action === 'ssm') next = await promptSsm(connection, existing);
     else {
       next = { ...existing };
       delete next.ssm;
       delete next.awsSecret;
     }
     saveManagedOverrides({ ...overrides, [connection.id]: next }, file);
-    log.success(
-      action === 'readOnly'
-        ? `${connection.name} is now ${next.readOnly ? 'read-only' : 'writable'}`
-        : `Saved ${connection.name}`
-    );
+    log.success(`Saved ${connection.name}`);
   }
   note(
-    `Saved to ${file}.\nRunning servers pick changes up on the next query. ` +
-      'A client registered with HOPSQL_READ_ONLY=true keeps every connection read-only.',
+    `Saved to ${file}.\nRunning servers pick changes up on the next call, no restart. ` +
+      'Access set here wins over HOPSQL_READ_ONLY=true; connections left at (default) follow it.',
     'Applied'
   );
   outro('Done');

@@ -305,7 +305,7 @@ export class WorkspaceConfigParser {
   async parseConnections(): Promise<DatabaseConnection[]> {
     const managed = loadManagedOverrides();
     const configured = loadConfiguredConnections().map((c) =>
-      applyOverride(c, managed[c.id] ?? managed[c.name])
+      applyOverride(c, managed[c.id] ?? managed[c.name], true)
     );
     configured.forEach(registerConnectionPrivacy);
     if (!this.discoverWorkspace())
@@ -344,7 +344,8 @@ export class WorkspaceConfigParser {
     discovered = discovered.map((c) =>
       applyOverride(
         applyOverride(c, overrides[c.id] ?? overrides[c.name]),
-        managed[c.id] ?? managed[c.name]
+        managed[c.id] ?? managed[c.name],
+        true
       )
     );
     const ids = new Set(configured.map((c) => c.id));
