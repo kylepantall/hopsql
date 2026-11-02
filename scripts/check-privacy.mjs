@@ -103,7 +103,7 @@ try {
     for (const connection of connections) {
       assert.deepEqual(
         Object.keys(connection).sort(),
-        ['capabilities', 'driver', 'id', 'limits', 'name', 'readonly']
+        ['askBeforeWrite', 'capabilities', 'driver', 'id', 'limits', 'name', 'readonly']
           .filter((k) => connection[k] !== undefined)
           .sort()
       );

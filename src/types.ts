@@ -25,6 +25,13 @@ export interface DatabaseConnection {
   description?: string;
   connected?: boolean;
   readonly?: boolean;
+  /** Writes need the user's approval in the client, one call at a time. */
+  askBeforeWrite?: boolean;
+  /**
+   * Access was set in the managed overrides file (`hopsql manage` / `hopsql
+   * access`), which wins over a HOPSQL_READ_ONLY=true server ceiling.
+   */
+  accessManaged?: boolean;
   folder?: string;
   properties?: Record<string, string>;
   /** Populated when the workspace routes this connection through an SSH tunnel. */
@@ -68,12 +75,18 @@ export interface AwsSecretConfig {
   profile?: string;
 }
 
+/** How a connection takes writes: refused, approved per call by the user, or allowed. */
+export type WriteAccess = 'read-only' | 'ask' | 'writable';
+export const WRITE_ACCESS_MODES: readonly WriteAccess[] = ['read-only', 'ask', 'writable'];
+
 /** Per-connection settings the config file layers onto discovered connections. */
 export interface ConnectionOverride {
   ssm?: SsmConfig;
   awsSecret?: AwsSecretConfig;
-  /** Replaces the connection's own read-only flag. */
+  /** Replaces the connection's own read-only flag. Older form of `access`. */
   readOnly?: boolean;
+  /** Replaces the connection's own read-only flag; `ask` approves each write. */
+  access?: WriteAccess;
 }
 
 /**

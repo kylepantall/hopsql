@@ -43,6 +43,7 @@
     "test:results": "bun run build && bun scripts/check-results.mjs",
     "test:catalogs": "bun run build && bun scripts/check-catalogs.mjs",
     "test:privacy": "bun run build && bun scripts/check-privacy.mjs",
+    "test:access": "bun run build && bun scripts/check-access.mjs",
     "docs:tools": "bun run build && bun scripts/export-tools.mjs",
     "test:tls": "bun run build && bun scripts/check-tls.mjs",
     "test:duckdb": "bun run build && bun scripts/check-duckdb.mjs",

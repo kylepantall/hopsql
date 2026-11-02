@@ -34,6 +34,8 @@ jobs:
         run: bun scripts/check-catalogs.mjs && node scripts/check-catalogs.mjs
       - name: Check model-visible privacy on both runtimes
         run: bun scripts/check-privacy.mjs && node scripts/check-privacy.mjs
+      - name: Check live access modes, ask approvals and exec on both runtimes
+        run: bun scripts/check-access.mjs && node scripts/check-access.mjs
       - name: Verify packed npm CLI on both runtimes
         run: bun scripts/check-package.mjs && node scripts/check-package.mjs
       - run: bun audit --audit-level=high

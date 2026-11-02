@@ -7,6 +7,8 @@ import { publicConnection, sanitizeDiagnostic } from './privacy.js';
 import { mysqlNameEquals, duckdbNameEquals } from './metadata/names.js';
 import { sqlDialect } from './policy/analyzer.js';
 import { validateReadStatement, validateStatement } from './policy/sql.js';
+import fs from 'node:fs';
+import path from 'node:path';
 /**
  * Resolve the DB client CLI executable path.
  *
@@ -352,6 +354,41 @@ export function validateQuery(query: string): string | null {
 
 export function enforceReadOnly(query: string): string | null {
   return validateReadStatement(query);
+}
+
+export const SQL_FILE_EXTENSIONS = ['.sql', '.psql', '.pgsql', '.mysql', '.ddl', '.dml'];
+export const MAX_SQL_FILE_BYTES = 1024 * 1024;
+
+/**
+ * Read a query from a local SQL file. Only SQL extensions are accepted, so a
+ * caller cannot send arbitrary files (keys, dotfiles) to a database, where an
+ * error message could echo their contents back.
+ */
+export function readSqlFile(file: string, cwd = process.cwd()): string {
+  const resolved = path.resolve(cwd, file);
+  if (!SQL_FILE_EXTENSIONS.includes(path.extname(resolved).toLowerCase()))
+    throw new Error(`SQL files must end in ${SQL_FILE_EXTENSIONS.join(', ')}`);
+  let stat: fs.Stats;
+  try {
+    // Follow symlinks so the extension check applies to the real file too.
+    const real = fs.realpathSync(resolved);
+    if (!SQL_FILE_EXTENSIONS.includes(path.extname(real).toLowerCase()))
+      throw new Error(`SQL files must end in ${SQL_FILE_EXTENSIONS.join(', ')}`);
+    stat = fs.statSync(real);
+    if (!stat.isFile()) throw new Error('SQL file is not a regular file');
+    if (stat.size > MAX_SQL_FILE_BYTES) throw new Error('SQL file exceeds 1 MiB');
+    return fs.readFileSync(real, 'utf8');
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === 'ENOENT') throw new Error('SQL file not found');
+    throw error;
+  }
+}
+
+/** Exactly one of `query` or `file`; the file is read as the query text. */
+export function resolveQueryText(args: { query?: string; file?: string }): string {
+  if ((args.query === undefined) === (args.file === undefined))
+    throw new Error('Provide exactly one of query or file');
+  return args.query ?? readSqlFile(args.file!);
 }
 
 /** Validate target names without changing which saved connection they identify. */

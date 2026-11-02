@@ -150,18 +150,51 @@ Run `hopsql` (or `hopsql manage`) in a terminal to pick a connection and:
 
 | Action | Effect |
 |---|---|
-| Make read-only / Allow writes | Per-connection write switch |
+| Access: read-only / ask / writable | Per-connection writes: refused, approved by you in the client one statement at a time, or allowed |
+| Change access for several connections | The same, for a multi-selection |
 | Set up an AWS SSM hop | Bastion by Name tag or instance ID, remote host/port, optional Secrets Manager login |
 | Remove the AWS SSM hop | Back to the connection's own settings |
 | Dump tools and folder | Shows the `pg_dump` / `mariadb-dump` / `mysqldump` the server will use (with versions), lets you pin one, and sets where saved dumps go |
 
-Changes are saved to `~/.config/hopsql/overrides.json` (`HOPSQL_OVERRIDES_FILE` to move it) and apply on the next query; no re-registration. They win over `overrides` in `HOPSQL_CONFIG_FILE`. `HOPSQL_READ_ONLY=true` still makes every connection read-only. MCP clients start Hopsql with piped stdio, so they still get the server; `hopsql serve` forces it in a terminal.
+Changes are saved to `~/.config/hopsql/overrides.json` (`HOPSQL_OVERRIDES_FILE` to move it) and apply on the next call; no restart or re-registration. They win over `overrides` in `HOPSQL_CONFIG_FILE`.
+
+⚠️ Access set here also wins over `HOPSQL_READ_ONLY=true`, which now only covers connections left at their default. Policy-file `readOnly` rules still always apply. Write tools appear in the client's tool list as soon as any connection can take writes (the server sends `tools/list_changed`).
+
+Bulk changes from a script or shell:
+
+```bash
+hopsql access                                # list connections and their access
+hopsql access ask prod-db reporting          # by id or name
+hopsql access read-only --all
+hopsql access reset staging                  # back to the connection's default
+```
+
+`ask` prompts in the MCP client for each `write_query`, `create_table`, `alter_table`, `drop_table` and write statement in a transaction, showing the SQL. An approval covers that one call only. Clients that can't prompt are refused, and so are `hopsql query --write` and `hopsql exec`. A model that has a shell can run `hopsql access` itself, so `ask` protects against MCP-only clients, not a model with terminal access. MCP clients start Hopsql with piped stdio, so they still get the server; `hopsql serve` forces it in a terminal.
 
 ### Dumps
 
 `dump_table` / `dump_database` find the dump client themselves: `HOPSQL_PG_DUMP_PATH` / `HOPSQL_MYSQLDUMP_PATH`, then a client pinned in `hopsql manage`, then the newest one on PATH or in the usual install folders (Homebrew `libpq`/`postgresql@N`/`mysql-client`/`mariadb`, Postgres.app, Program Files). A newer `pg_dump` can dump older servers, never the reverse.
 
 Pass `saveToFile: true` to write the dump to a new owner-only file in the dump folder (default `~/hopsql-dumps`; `HOPSQL_DUMP_DIR` or `hopsql manage` to change) and get its path back, instead of a `read_export` handle. `fileName` picks the name; existing files are never replaced. Saved dumps are capped by `HOPSQL_DUMP_FILE_MAX_BYTES` (default 8 GiB), not the 32 MiB artifact limit.
+
+## Command line
+
+| Command | What it does |
+|---|---|
+| `hopsql query <conn> --file report.sql` | Runs one statement from a `.sql`/`.psql`/`.pgsql`/`.mysql`/`.ddl`/`.dml` file (max 1 MiB) through `execute_query`, with the same policy and JSON output. Inline SQL works too: `hopsql query <conn> "SELECT 1"` |
+| `hopsql query <conn> --write --file fix.sql` | The same through `write_query`; needs `HOPSQL_READ_ONLY=false` and a writable connection |
+| `hopsql exec <conn> -- psql -c 'select 1'` | Runs a local tool with the connection's credentials in its environment (`PG*` or `MYSQL_HOST`/`MYSQL_TCP_PORT`/`MYSQL_USER`/`MYSQL_PWD`, plus `DATABASE_URL`), through the same SSH/SSM tunnel |
+| `hopsql update` | Checks GitHub for a newer release and reruns the installer for it (`--check` only reports, `--yes` skips the prompt, `--json` for scripts) |
+
+The CLI reads the same `HOPSQL_*` variables as the server, so export `HOPSQL_CONFIG_FILE` (and any allowlist) in your shell if your MCP entry sets them.
+
+`exec` is for PostgreSQL and MySQL/MariaDB connections. It refuses read-only connections, because raw credentials bypass Hopsql's SQL policy. Model-driven shells get piped output, so the password is masked there as `********`. It still stops accidental leaks only: a command that deliberately encodes the password could get it out.
+
+`execute_query` and `write_query` take a `file` path instead of `query` too, so a model can run a SQL file without pasting it.
+
+### Updates
+
+The server checks GitHub releases at startup, at most once a day, and prints a notice on stderr when a newer one exists (`HOPSQL_UPDATE_NOTIFIER=false` turns this off). Models can call `check_for_update`, then `update_hopsql`. The latter asks you to confirm in the client before downloading anything, and refuses clients that can't ask. Updates only apply to copies installed by `install.sh`/`install.ps1`. Restart your MCP clients afterwards.
 
 ## One server, many instances
 
@@ -184,7 +217,8 @@ Large results use private, expiring handles with row and column pagination. Long
 | `HOPSQL_PROJECT` | Restrict discovery to one DB client project/workspace folder | All projects |
 | `HOPSQL_TIMEOUT` | Query timeout (ms) | `30000` |
 | `HOPSQL_DEBUG` | Enable debug logging | `false` |
-| `HOPSQL_UPDATE_NOTIFIER` | Check npm for updates and show notices on stderr | `true` |
+| `HOPSQL_UPDATE_NOTIFIER` | Check GitHub releases at startup and show notices on stderr | `true` |
+| `HOPSQL_REPO` | GitHub repository for update checks and `hopsql update` | `kylepantall/hopsql` |
 | `HOPSQL_READ_ONLY` | Disable all write operations | `true` |
 | `HOPSQL_ALLOWED_CONNECTIONS` | Comma-separated whitelist of connection IDs or names | All |
 | `HOPSQL_DISABLED_TOOLS` | Comma-separated tools to disable | None |
@@ -264,8 +298,8 @@ Restrict which workspace connections are visible. Accepts connection IDs or disp
 - `test_connection` - Test connectivity
 
 ### Data Operations
-- `execute_query` - Run read-only queries (SELECT, EXPLAIN, SHOW, DESCRIBE only)
-- `write_query` - Run INSERT/UPDATE/DELETE
+- `execute_query` - Run read-only queries (SELECT, EXPLAIN, SHOW, DESCRIBE only), inline or from a `file`
+- `write_query` - Run INSERT/UPDATE/DELETE, inline or from a `file`
 - `export_data` - Export to CSV/JSON, with optional gzip, Brotli, or zstd
 - `read_result` - Read a page of stored rows and columns
 - `read_result_cell` - Read a long cell in chunks
@@ -304,6 +338,8 @@ PostgreSQL, MySQL/MariaDB, and SQL Server support explicit transactions. Results
 - `get_database_stats` - Database statistics
 - `append_insight` - Store analysis notes
 - `list_insights` - Retrieve stored notes
+- `check_for_update` - Compare this install with the latest GitHub release
+- `update_hopsql` - Install the latest release after the user confirms in the client
 
 ## Security
 

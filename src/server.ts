@@ -57,8 +57,13 @@ import {
 } from './runtime-config.js';
 import { validateToolArguments } from './policy/arguments.js';
 import { validateStatement } from './policy/sql.js';
-import { checkForUpdate } from './update-check.js';
+import { checkForUpdate, getUpdateStatus, installLocation, runUpdate } from './update-check.js';
 import { WorkspaceConfigParser } from './config-parser.js';
+import {
+  loadManagedOverrides,
+  managedOverridesPath,
+  overrideAccess,
+} from './connections-config.js';
 import { WorkspaceClient } from './workspace-client.js';
 import type {
   BusinessInsight,
@@ -76,6 +81,7 @@ import {
   formatError,
   convertToCSV,
   redactConnection,
+  resolveQueryText,
 } from './utils.js';
 import { ConnectionPoolManager } from './pools/index.js';
 import { sshTunnelManager, type HostKeyQuestion } from './net/ssh-tunnel.js';
@@ -94,6 +100,12 @@ const packageJson = JSON.parse(
   fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf-8')
 );
 const VERSION = packageJson.version;
+
+const SQL_FILE_PROPERTY = {
+  type: 'string',
+  description:
+    'Instead of query: absolute path to a local .sql/.psql/.pgsql/.mysql/.ddl/.dml file (max 1 MiB) holding one statement. Relative paths resolve against the server working directory',
+};
 
 // Tool categories for filtering
 const WRITE_TOOLS = [
@@ -151,6 +163,8 @@ export class HopsqlMCPServer {
   private disabledTools: string[];
   private allowedConnections: Set<string> | null; // null = allow all
   private staleCleanupInterval: ReturnType<typeof setInterval> | null = null;
+  /** Run a tool with the same validation and policy as an MCP call; the CLI uses it too. */
+  callTool!: (name: string, args: unknown) => Promise<any>;
 
   constructor() {
     this.debug = process.env.HOPSQL_DEBUG === 'true';
@@ -175,7 +189,8 @@ export class HopsqlMCPServer {
       },
       {
         capabilities: {
-          tools: {},
+          // Write tools come and go as `hopsql access` changes connections.
+          tools: { listChanged: true },
           resources: {},
         },
       }
@@ -562,7 +577,8 @@ export class HopsqlMCPServer {
       },
       {
         name: 'get_connection_info',
-        description: 'Get detailed information about a specific database connection',
+        description:
+          'Get detailed information about a specific database connection. Credentials are never returned: to run a local tool (psql, mysql, migrations, scripts) against a writable PostgreSQL/MySQL/MariaDB connection, run `hopsql exec <connectionId> -- <command>` in a shell, which injects PG*/MYSQL_*/DATABASE_URL into that command only',
         inputSchema: {
           type: 'object',
           properties: {
@@ -588,13 +604,14 @@ export class HopsqlMCPServer {
               type: 'string',
               description: 'The SQL query to execute (SELECT statements only)',
             },
+            file: SQL_FILE_PROPERTY,
             maxRows: {
               type: 'number',
               description: 'Maximum number of rows to return (default: 1000)',
               default: 1000,
             },
           },
-          required: ['connectionId', 'query'],
+          required: ['connectionId'],
         },
       },
       {
@@ -611,9 +628,22 @@ export class HopsqlMCPServer {
               type: 'string',
               description: 'The SQL query to execute (INSERT, UPDATE, DELETE)',
             },
+            file: SQL_FILE_PROPERTY,
           },
-          required: ['connectionId', 'query'],
+          required: ['connectionId'],
         },
+      },
+      {
+        name: 'check_for_update',
+        description:
+          'Check GitHub for a newer Hopsql release. When one is available, offer the user to install it with update_hopsql or by running "hopsql update"',
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'update_hopsql',
+        description:
+          'Install the latest Hopsql release. The user confirms in the client before anything is downloaded; MCP clients need a restart afterwards',
+        inputSchema: { type: 'object', properties: {} },
       },
       {
         name: 'create_table',
@@ -1079,7 +1109,9 @@ export class HopsqlMCPServer {
         properties.maxRows.minimum = 1;
       }
       tool.annotations = {
-        readOnlyHint: !WRITE_TOOLS.includes(tool.name) && tool.name !== 'append_insight',
+        readOnlyHint:
+          !WRITE_TOOLS.includes(tool.name) &&
+          !['append_insight', 'update_hopsql'].includes(tool.name),
         destructiveHint: WRITE_TOOLS.includes(tool.name),
         openWorldHint: true,
       };
@@ -1106,8 +1138,8 @@ export class HopsqlMCPServer {
       // Filter tools based on read-only mode and disabled tools
       let filteredTools = tools;
 
-      // Remove write tools if read-only mode is enabled
-      if (this.readOnly) {
+      // Remove write tools while no connection can take writes
+      if (!this.writesPossible()) {
         filteredTools = filteredTools.filter((tool) => !WRITE_TOOLS.includes(tool.name));
       }
 
@@ -1119,22 +1151,24 @@ export class HopsqlMCPServer {
       return { tools: filteredTools };
     });
 
-    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
-      const { name } = request.params;
+    this.server.setRequestHandler(CallToolRequestSchema, (request) =>
+      this.callTool(request.params.name, request.params.arguments)
+    );
+    this.callTool = async (name, rawArgs) => {
       const definition = tools.find((tool) => tool.name === name);
       if (!definition) throw new McpError(ErrorCode.MethodNotFound, `Unknown tool: ${name}`);
       let args: Record<string, unknown>;
       try {
-        args = validateToolArguments(definition, request.params.arguments);
+        args = validateToolArguments(definition, rawArgs);
       } catch (error) {
         throw new McpError(ErrorCode.InvalidParams, formatError(error));
       }
 
       // Block write tools if read-only mode is enabled
-      if (this.readOnly && WRITE_TOOLS.includes(name)) {
+      if (WRITE_TOOLS.includes(name) && !this.writesPossible()) {
         throw new McpError(
           ErrorCode.InvalidRequest,
-          `Tool '${name}' is disabled in read-only mode. Set HOPSQL_READ_ONLY=false to enable write operations.`
+          `Tool '${name}' is disabled: every connection is read-only. Ask the user to run "hopsql access writable <connection>" (or "ask"); it applies without a restart.`
         );
       }
 
@@ -1211,21 +1245,22 @@ export class HopsqlMCPServer {
             return await this.handleGetConnectionInfo(args as { connectionId: string });
 
           case 'execute_query':
-            return await this.handleExecuteQuery(
-              args as {
-                connectionId: string;
-                query: string;
-                maxRows?: number;
-              }
-            );
+            return await this.handleExecuteQuery({
+              ...(args as { connectionId: string; database?: string; maxRows?: number }),
+              query: this.queryArgument(args),
+            });
 
           case 'write_query':
-            return await this.handleWriteQuery(
-              args as {
-                connectionId: string;
-                query: string;
-              }
-            );
+            return await this.handleWriteQuery({
+              ...(args as { connectionId: string; database?: string }),
+              query: this.queryArgument(args),
+            });
+
+          case 'check_for_update':
+            return this.toolResult(await getUpdateStatus(VERSION, { maxAgeMs: 60 * 60 * 1000 }));
+
+          case 'update_hopsql':
+            return this.toolResult(await this.handleUpdate());
 
           case 'create_table':
             return await this.handleCreateTable(
@@ -1369,7 +1404,7 @@ export class HopsqlMCPServer {
 
         throw new McpError(ErrorCode.InternalError, `Tool execution failed: ${formatError(error)}`);
       }
-    });
+    };
   }
 
   private async handleListDatabases(args: { connectionId: string }) {
@@ -1393,7 +1428,8 @@ export class HopsqlMCPServer {
   private connectionInfo(connection: DatabaseConnection) {
     return {
       ...redactConnection(connection),
-      readonly: this.readOnly || this.accessPolicy.isReadOnly(connection),
+      readonly: this.isReadOnly(connection),
+      askBeforeWrite: !this.isReadOnly(connection) && connection.askBeforeWrite === true,
       limits: connection.limits,
       capabilities: this.workspaceClient.getCapabilities(connection),
     };
@@ -1582,11 +1618,10 @@ export class HopsqlMCPServer {
     }
 
     const connection = await this.getConnection(connectionId, args.database);
-    if (connection && this.accessPolicy.isReadOnly(connection))
-      throw new McpError(ErrorCode.InvalidRequest, 'This saved connection is read-only');
     if (!connection) {
       throw new McpError(ErrorCode.InvalidParams, `Connection not found: ${connectionId}`);
     }
+    await this.assertWritable(connection, query);
 
     const result = await this.workspaceClient.executeQuery(connection, query);
 
@@ -1624,11 +1659,10 @@ export class HopsqlMCPServer {
     }
 
     const connection = await this.getConnection(connectionId, args.database);
-    if (connection && this.accessPolicy.isReadOnly(connection))
-      throw new McpError(ErrorCode.InvalidRequest, 'This saved connection is read-only');
     if (!connection) {
       throw new McpError(ErrorCode.InvalidParams, `Connection not found: ${connectionId}`);
     }
+    await this.assertWritable(connection, query);
 
     const result = await this.workspaceClient.executeQuery(connection, query);
 
@@ -1662,11 +1696,10 @@ export class HopsqlMCPServer {
     }
 
     const connection = await this.getConnection(connectionId, args.database);
-    if (connection && this.accessPolicy.isReadOnly(connection))
-      throw new McpError(ErrorCode.InvalidRequest, 'This saved connection is read-only');
     if (!connection) {
       throw new McpError(ErrorCode.InvalidParams, `Connection not found: ${connectionId}`);
     }
+    await this.assertWritable(connection, query);
 
     const result = await this.workspaceClient.executeQuery(connection, query);
 
@@ -1721,11 +1754,11 @@ export class HopsqlMCPServer {
     }
 
     const connection = await this.getConnection(connectionId, args.database);
-    if (connection && this.accessPolicy.isReadOnly(connection))
-      throw new McpError(ErrorCode.InvalidRequest, 'This saved connection is read-only');
     if (!connection) {
       throw new McpError(ErrorCode.InvalidParams, `Connection not found: ${connectionId}`);
     }
+    // Refuse read-only connections before touching the table; ask once the SQL is known.
+    this.assertNotReadOnly(connection);
 
     // Check if table exists first
     try {
@@ -1738,6 +1771,7 @@ export class HopsqlMCPServer {
     }
 
     const dropQuery = `DROP TABLE ${quoteQualifiedIdentifier(tableName, connection.driver)}`;
+    await this.assertWritable(connection, dropQuery);
     const result = await this.workspaceClient.executeQuery(connection, dropQuery);
 
     return {
@@ -2342,12 +2376,11 @@ export class HopsqlMCPServer {
   private async handleBeginTransaction(args: { connectionId: string; database?: string }) {
     const connectionId = sanitizeConnectionId(args.connectionId);
     const connection = await this.getConnection(connectionId, args.database);
-    if (connection && this.accessPolicy.isReadOnly(connection))
-      throw new McpError(ErrorCode.InvalidRequest, 'This saved connection is read-only');
-
     if (!connection) {
       throw new McpError(ErrorCode.InvalidParams, `Connection not found: ${connectionId}`);
     }
+    // Ask connections approve each write statement inside the transaction instead.
+    this.assertNotReadOnly(connection);
 
     const result = await this.transactionManager.beginTransaction(connection);
 
@@ -2396,6 +2429,13 @@ export class HopsqlMCPServer {
     const transaction = this.transactionManager.getTransaction(args.transactionId);
     if (!transaction) throw new Error('Transaction not found or expired');
     const scope = this.transactionManager.resultScope(args.transactionId);
+    // Recheck live: access may have changed since the transaction began. The
+    // session can write, and the read classifier is a blocklist (a SELECT can
+    // call a writing function), so ask connections approve every statement.
+    const current = await this.getConnection(scope.connection.id);
+    if (!current) throw new Error('Transaction connection is no longer accessible');
+    if (current.askBeforeWrite || enforceReadOnly(args.query) !== null)
+      await this.assertWritable(current, args.query);
     const source = this.artifactSource(scope.connection, args.query, scope.policyRevision);
     const result = await this.transactionManager.executeInTransaction(
       args.transactionId,
@@ -2580,6 +2620,148 @@ export class HopsqlMCPServer {
     };
   }
 
+  /**
+   * Effective read-only state. Policy-file rules always hold; otherwise an
+   * access mode set in the managed file (`hopsql manage` / `hopsql access`)
+   * wins over the HOPSQL_READ_ONLY ceiling, so it applies without a restart.
+   */
+  private isReadOnly(connection: DatabaseConnection): boolean {
+    return this.accessPolicy.isReadOnly(connection) || (this.readOnly && !connection.accessManaged);
+  }
+
+  /** Whether any connection can take writes now; decides if write tools are listed. */
+  private writesPossible(): boolean {
+    if (!this.readOnly) return true;
+    try {
+      return Object.values(loadManagedOverrides()).some(
+        (override) => (overrideAccess(override) ?? 'read-only') !== 'read-only'
+      );
+    } catch {
+      return false;
+    }
+  }
+
+  private assertNotReadOnly(connection: DatabaseConnection): void {
+    if (this.isReadOnly(connection))
+      throw new McpError(ErrorCode.InvalidRequest, 'This saved connection is read-only');
+  }
+
+  /**
+   * Refuse read-only connections; on `ask` connections, have the user approve
+   * this one statement in the client. Approval never carries over to another call.
+   */
+  private async assertWritable(connection: DatabaseConnection, sql: string): Promise<void> {
+    this.assertNotReadOnly(connection);
+    if (!connection.askBeforeWrite) return;
+    if (!this.server.getClientCapabilities()?.elicitation)
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        'This connection asks before each write, and this client cannot ask the user'
+      );
+    // The user must see exactly what runs: never truncate, and collapse
+    // whitespace so padding cannot push part of the statement out of view.
+    if (sql.length > 4000)
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        'Statement is too long to show for approval; split it into smaller statements'
+      );
+    const shown = sql.replace(/\s+/g, ' ').trim();
+    const result = await this.server.elicitInput(
+      {
+        message: `Hopsql: allow this write on "${connection.name}"?\n\n${shown}`,
+        requestedSchema: {
+          type: 'object',
+          properties: { approve: { type: 'boolean', title: 'Run this statement', default: false } },
+          required: ['approve'],
+        },
+      },
+      { timeout: 5 * 60 * 1000 }
+    );
+    if (result.action !== 'accept' || result.content?.approve !== true)
+      throw new McpError(ErrorCode.InvalidRequest, 'The user did not approve this write');
+  }
+
+  private queryArgument(args: Record<string, unknown>): string {
+    try {
+      return resolveQueryText(args as { query?: string; file?: string });
+    } catch (error) {
+      throw new McpError(ErrorCode.InvalidParams, formatError(error));
+    }
+  }
+
+  private toolResult(value: object) {
+    return {
+      content: [{ type: 'text' as const, text: JSON.stringify(value) }],
+      structuredContent: value as Record<string, unknown>,
+    };
+  }
+
+  /**
+   * Install the latest release, but only after the user confirms in the client:
+   * the installer downloads and builds code, so a model alone may not start it.
+   */
+  private async handleUpdate() {
+    const status = await getUpdateStatus(VERSION, { maxAgeMs: 0 });
+    if (!status.updateAvailable) return { ...status, updated: false };
+    const location = installLocation();
+    if (!location)
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        'This copy was not installed by the Hopsql installer; update its checkout instead'
+      );
+    if (!this.server.getClientCapabilities()?.elicitation)
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        `This client cannot ask the user to confirm. Ask them to run "${status.command}" in a terminal.`
+      );
+    const result = await this.server.elicitInput(
+      {
+        message: `Hopsql: install ${status.latest!.version} (installed: ${VERSION}) from ${status.latest!.url}? MCP clients need a restart afterwards.`,
+        requestedSchema: {
+          type: 'object',
+          properties: { install: { type: 'boolean', title: 'Install update', default: false } },
+          required: ['install'],
+        },
+      },
+      { timeout: 5 * 60 * 1000 }
+    );
+    if (result.action !== 'accept' || result.content?.install !== true)
+      return { ...status, updated: false, declined: true };
+    await runUpdate(status.latest!.tag, { location, output: 'stderr' });
+    return { ...status, updated: true, restartRequired: true };
+  }
+
+  /**
+   * A saved connection for `hopsql exec`, under the same allowlist and access
+   * policy as the tools. Raw credentials bypass the SQL policy, so read-only
+   * connections are refused.
+   */
+  async connectionForExec(connectionId: string, database?: string): Promise<DatabaseConnection> {
+    const connection = await this.getConnection(sanitizeConnectionId(connectionId), database);
+    if (!connection) throw new Error(`Connection not found: ${connectionId}`);
+    if (this.accessPolicy.isReadOnly(connection) || connection.askBeforeWrite)
+      throw new Error(
+        'This connection is read-only or asks before writes in Hopsql; injected credentials would bypass that. Make it writable with "hopsql access writable <connection>" to use exec.'
+      );
+    return connection;
+  }
+
+  /**
+   * Access is re-read on every call; this only tells the client when write
+   * tools appear or disappear, so it refreshes its tool list without a restart.
+   */
+  private watchManagedAccess(): void {
+    let writes = this.writesPossible();
+    fs.watchFile(managedOverridesPath(), { interval: 1000, persistent: false }, () => {
+      const now = this.writesPossible();
+      if (now === writes) return;
+      writes = now;
+      this.server.sendToolListChanged().catch(() => {
+        /* A client that ignores list changes still gets the live checks. */
+      });
+    });
+  }
+
   /** Ask the user, through the MCP client, whether to trust an unknown SSH host key. */
   private async askToTrustHostKey(question: HostKeyQuestion): Promise<boolean> {
     const result = await this.server.elicitInput(
@@ -2627,6 +2809,7 @@ export class HopsqlMCPServer {
 
       this.log('Hopsql MCP server started successfully');
       void checkForUpdate(VERSION);
+      this.watchManagedAccess();
 
       // Periodic cleanup of stale transactions (leaked transactions older than 1 hour)
       this.staleCleanupInterval = setInterval(async () => {
@@ -2658,6 +2841,11 @@ export class HopsqlMCPServer {
       process.exit(1);
     }
   }
+}
+
+/** A server that is never connected to a transport, for CLI commands. */
+export function createServer(): HopsqlMCPServer {
+  return new HopsqlMCPServer();
 }
 
 export async function startServer(): Promise<void> {

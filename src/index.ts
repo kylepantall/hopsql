@@ -46,6 +46,36 @@ if (process.argv[2] === 'install') {
   process.exit(0);
 }
 
+if (['update', 'query', 'exec', 'access'].includes(process.argv[2])) {
+  const args = process.argv.slice(3);
+  try {
+    if (process.argv[2] === 'access') {
+      const { runAccessCommand } = await import('./manage.js');
+      await runAccessCommand(args);
+      process.exit(0);
+    }
+    if (process.argv[2] === 'update') {
+      const { runUpdateCommand } = await import('./update.js');
+      await runUpdateCommand(args, VERSION);
+      process.exit(0);
+    }
+    const { createServer } = await import('./server.js');
+    const server = createServer();
+    if (process.argv[2] === 'exec') {
+      const { runExec } = await import('./exec.js');
+      process.exit(await runExec(args, (id, database) => server.connectionForExec(id, database)));
+    }
+    const { parseQueryArgs } = await import('./query-cli.js');
+    const { tool, args: toolArgs } = parseQueryArgs(args);
+    const result = await server.callTool(tool, toolArgs);
+    process.stdout.write(result.content[0].text + '\n');
+    process.exit(0);
+  } catch (error) {
+    console.error(sanitizeDiagnostic(error instanceof Error ? error.message : String(error)));
+    process.exit(1);
+  }
+}
+
 if (process.argv.includes('--help') || process.argv.includes('-h')) {
   console.error(`
 Hopsql MCP Server v${VERSION}
@@ -54,6 +84,13 @@ Usage: hopsql                 Manage connections (in a terminal; MCP clients get
        hopsql manage          Turn connections read-only, set up SSM hops and secrets
        hopsql serve [options] Run the MCP server even in a terminal
        hopsql install [claude|codex|opencode] [--config <file> | --workspace <directory>] [--allow <ids>] [--allow-writes] [--dry-run]
+       hopsql access [<read-only|ask|writable|reset> (<connection>... | --all)]
+                              List or bulk-change write access; running servers apply it on the next call
+       hopsql query <connection> (<sql> | --file <query.sql>) [--write] [--database <name>] [--max-rows <n>]
+       hopsql exec <connection> [--database <name>] -- <command> [args...]
+                              Run a tool (psql, mysql, migrations) with the connection's credentials in its env
+       hopsql update [--check] [--yes] [--json]
+                              Install the latest GitHub release
 
 Quick setup:
   curl -fsSL https://raw.githubusercontent.com/kylepantall/hopsql/main/scripts/install.sh | bash -s -- --claude
@@ -75,7 +112,7 @@ Environment Variables:
   HOPSQL_PROJECT              Read only this workspace project (default: all projects)
   HOPSQL_TIMEOUT              Query timeout in milliseconds (default: 30000)
   HOPSQL_DEBUG                Enable debug logging (true/false)
-  HOPSQL_UPDATE_NOTIFIER      Check npm for updates (default: true; set false to disable)
+  HOPSQL_UPDATE_NOTIFIER      Check GitHub releases for updates at startup (default: true; set false to disable)
   HOPSQL_READ_ONLY            Disable all write operations (default: true; false requires connection write permission)
   HOPSQL_ALLOWED_CONNECTIONS  Comma-separated whitelist of connection IDs or names
   HOPSQL_DISABLED_TOOLS       Comma-separated list of tools to disable

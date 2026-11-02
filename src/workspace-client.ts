@@ -123,7 +123,9 @@ export class WorkspaceClient {
       const readOnly =
         options.readOnly === true ||
         this.policy.isReadOnly(connection) ||
-        booleanSetting(process.env.HOPSQL_READ_ONLY, 'HOPSQL_READ_ONLY', true);
+        // Access set with `hopsql manage` / `hopsql access` outranks the env ceiling.
+        (booleanSetting(process.env.HOPSQL_READ_ONLY, 'HOPSQL_READ_ONLY', true) &&
+          !connection.accessManaged);
       if (!options.trustedMetadata) await this.checkQueryAccess(connection, query, readOnly);
       else this.policy.assertConnection(connection);
       const target = options.trustedMetadata
