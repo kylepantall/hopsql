@@ -31,6 +31,33 @@ export function updateRepository(env = process.env): string {
   return repo;
 }
 
+/**
+ * GitHub web and raw-content origins. HOPSQL_UPDATE_GITHUB_URL and
+ * HOPSQL_UPDATE_RAW_URL point update checks at a mirror or a test fixture.
+ */
+export function updateHosts(env = process.env): { web: string; raw: string } {
+  const origin = (value: string | undefined, fallback: string, name: string) => {
+    if (!value) return fallback;
+    let url: URL;
+    try {
+      url = new URL(value);
+    } catch {
+      throw new Error(`Invalid ${name}`);
+    }
+    if (!['https:', 'http:'].includes(url.protocol) || url.pathname !== '/' || url.search)
+      throw new Error(`Invalid ${name}`);
+    return url.origin;
+  };
+  return {
+    web: origin(env.HOPSQL_UPDATE_GITHUB_URL, 'https://github.com', 'HOPSQL_UPDATE_GITHUB_URL'),
+    raw: origin(
+      env.HOPSQL_UPDATE_RAW_URL,
+      'https://raw.githubusercontent.com',
+      'HOPSQL_UPDATE_RAW_URL'
+    ),
+  };
+}
+
 export interface LatestRelease {
   version: string;
   tag: string;
@@ -58,18 +85,20 @@ export async function fetchLatestRelease(
   options: CheckOptions = {}
 ): Promise<LatestRelease | null> {
   const repo = updateRepository(options.env);
+  const { web } = updateHosts(options.env);
+  const source = `${web}/${repo}`;
   const cacheDir = options.cacheDir ?? join(homedir(), '.cache', 'hopsql');
   const cacheFile = join(cacheDir, 'update.json');
   const maxAgeMs = options.maxAgeMs ?? DAY_MS;
   try {
     const cached = JSON.parse(await readFile(cacheFile, 'utf8'));
-    if (cached.repo === repo && Date.now() - cached.checkedAt < maxAgeMs) return cached.latest;
+    if (cached.source === source && Date.now() - cached.checkedAt < maxAgeMs) return cached.latest;
   } catch {
     /* A missing or invalid cache triggers a GitHub check. */
   }
   // The web redirect, not api.github.com: the unauthenticated API allows 60
   // requests an hour per IP, which shared office and VPN addresses exhaust.
-  const response = await (options.fetch ?? fetch)(`https://github.com/${repo}/releases/latest`, {
+  const response = await (options.fetch ?? fetch)(`${source}/releases/latest`, {
     method: 'HEAD',
     redirect: 'manual',
     headers: { 'User-Agent': 'hopsql-update-check' },
@@ -86,11 +115,11 @@ export async function fetchLatestRelease(
     const version = tag.replace(/^v/, '');
     if (!TAG_PATTERN.test(tag) || !VERSION_PATTERN.test(version))
       throw new Error('GitHub returned an unexpected release tag');
-    latest = { version, tag, url: `https://github.com/${repo}/releases/tag/${tag}` };
+    latest = { version, tag, url: `${source}/releases/tag/${tag}` };
   }
   try {
     await mkdir(cacheDir, { recursive: true });
-    await writeFile(cacheFile, JSON.stringify({ repo, latest, checkedAt: Date.now() }), {
+    await writeFile(cacheFile, JSON.stringify({ source, latest, checkedAt: Date.now() }), {
       mode: 0o600,
     });
   } catch {
@@ -182,7 +211,7 @@ export async function runUpdate(tag: string, options: RunUpdateOptions): Promise
   const windows = (options.platform ?? process.platform) === 'win32';
   const script = windows ? 'install.ps1' : 'install.sh';
   const response = await (options.fetch ?? fetch)(
-    `https://raw.githubusercontent.com/${repo}/${tag}/scripts/${script}`,
+    `${updateHosts(env).raw}/${repo}/${tag}/scripts/${script}`,
     { signal: AbortSignal.timeout(30000) }
   );
   if (!response.ok)

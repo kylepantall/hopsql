@@ -221,6 +221,7 @@ Large results use private, expiring handles with row and column pagination. Long
 | `HOPSQL_DEBUG` | Enable debug logging | `false` |
 | `HOPSQL_UPDATE_NOTIFIER` | Check GitHub releases at startup and show notices on stderr | `true` |
 | `HOPSQL_REPO` | GitHub repository for update checks and `hopsql update` | `kylepantall/hopsql` |
+| `HOPSQL_UPDATE_GITHUB_URL` / `HOPSQL_UPDATE_RAW_URL` | Origins for release checks and installer downloads (a mirror or test fixture) | `https://github.com` / `https://raw.githubusercontent.com` |
 | `HOPSQL_READ_ONLY` | Disable all write operations | `true` |
 | `HOPSQL_ALLOWED_CONNECTIONS` | Comma-separated whitelist of connection IDs or names | All |
 | `HOPSQL_DISABLED_TOOLS` | Comma-separated tools to disable | None |

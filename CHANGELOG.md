@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `HOPSQL_UPDATE_GITHUB_URL` / `HOPSQL_UPDATE_RAW_URL`: point update checks and installer downloads at a mirror.
+- CI covers ask approvals inside transactions (Postgres, MySQL, MariaDB, SQL Server) and the approval-gated update flow end to end.
+
 ## [1.1.0] - 2026-11-02
 
 ### Added

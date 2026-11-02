@@ -13,6 +13,7 @@ import sql from 'mssql';
 import oracledb from 'oracledb';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StdioClientTransport } from '@modelcontextprotocol/sdk/client/stdio.js';
+import { ElicitRequestSchema } from '@modelcontextprotocol/sdk/types.js';
 
 const engines = (
   process.argv.find((arg) => arg.startsWith('--engines='))?.split('=')[1] ?? 'postgres,mysql'
@@ -526,6 +527,84 @@ try {
           /not found/
         );
         assert.equal((await admin.query('SELECT status FROM orders WHERE id=1'))[0].status, 'paid');
+
+        // ask access: inside a transaction every statement needs the user's
+        // approval, even under a HOPSQL_READ_ONLY=true ceiling, because the
+        // session can write and a SELECT can call a writing function.
+        const overrides = join(workspace, 'ask-overrides.json');
+        writeFileSync(
+          overrides,
+          JSON.stringify({ version: 1, overrides: { fixture: { access: 'ask' } } }),
+          { mode: 0o600 }
+        );
+        const prompts = [];
+        let approve = false;
+        const asking = new Client(
+          { name: 'hopsql-integration-ask', version: '1.0.0' },
+          { capabilities: { elicitation: {} } }
+        );
+        asking.setRequestHandler(ElicitRequestSchema, async (request) => {
+          prompts.push(request.params.message);
+          return approve ? { action: 'accept', content: { approve: true } } : { action: 'decline' };
+        });
+        await asking.connect(
+          new StdioClientTransport({
+            command: process.execPath,
+            args: [resolve('dist/index.js')],
+            stderr: 'pipe',
+            env: {
+              ...process.env,
+              HOPSQL_WORKSPACE: workspace,
+              HOPSQL_PROJECT: 'Synthetic',
+              HOPSQL_ALLOWED_CONNECTIONS: 'fixture',
+              HOPSQL_READ_ONLY: 'true',
+              HOPSQL_UPDATE_NOTIFIER: 'false',
+              HOPSQL_DISABLED_TOOLS: '',
+              HOPSQL_OVERRIDES_FILE: overrides,
+            },
+          })
+        );
+        try {
+          const status = async () =>
+            (await admin.query('SELECT status FROM orders WHERE id=1'))[0].status;
+          const asked = await call(asking, 'begin_transaction', { connectionId: 'fixture' });
+          assert.equal(prompts.length, 0, 'Beginning a transaction changes nothing');
+          const update = {
+            transactionId: asked.transactionId,
+            query: "UPDATE orders SET status='approved' WHERE id=1",
+          };
+          await assert.rejects(() => call(asking, 'execute_in_transaction', update));
+          assert.equal(prompts.length, 1);
+          await assert.rejects(() =>
+            call(asking, 'execute_in_transaction', {
+              transactionId: asked.transactionId,
+              query: 'SELECT COUNT(*) AS n FROM orders',
+            })
+          );
+          assert.equal(prompts.length, 2, 'Reads inside an ask transaction are approved too');
+          if (engine === 'postgres') {
+            // A function that writes, called from a SELECT the classifier accepts.
+            await admin.query(
+              "CREATE OR REPLACE FUNCTION hopsql_touch() RETURNS int LANGUAGE sql AS $$ UPDATE orders SET status='function' WHERE id=1 RETURNING 1 $$"
+            );
+            await assert.rejects(() =>
+              call(asking, 'execute_in_transaction', {
+                transactionId: asked.transactionId,
+                query: 'SELECT hopsql_touch()',
+              })
+            );
+            assert.equal(prompts.length, 3);
+          }
+          approve = true;
+          await call(asking, 'execute_in_transaction', update);
+          assert(prompts.at(-1).includes("status='approved'"), 'The prompt shows the statement');
+          await call(asking, 'commit_transaction', { transactionId: asked.transactionId });
+          assert.equal(await status(), 'approved');
+          if (engine === 'postgres') await admin.query('DROP FUNCTION hopsql_touch()');
+        } finally {
+          await asking.close();
+          await admin.query("UPDATE orders SET status='paid' WHERE id=1");
+        }
       }
       await client.close();
       const instanceFile = join(workspace, 'instances.json');
