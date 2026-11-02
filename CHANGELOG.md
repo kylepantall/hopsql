@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `HOPSQL_UPDATE_GITHUB_URL` / `HOPSQL_UPDATE_RAW_URL`: point update checks and installer downloads at a mirror.
+- CI covers ask approvals inside transactions (Postgres, MySQL, MariaDB, SQL Server) and the approval-gated update flow end to end.
+
 ## [1.1.0] - 2026-11-02
 
 ### Added
@@ -21,7 +26,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `execute_query` / `write_query` accept a `file` (`.sql`, `.psql`, `.pgsql`, `.mysql`, `.ddl`, `.dml`; max 1 MiB) instead of `query`.
 - `hopsql query <conn> (<sql> | --file <f>) [--write]`: run a statement from the terminal under the server's policy.
 - `hopsql exec <conn> -- <command>`: run a local tool with the connection's credentials injected as `PG*` / `MYSQL_*` / `DATABASE_URL`, tunnel included; the password is masked in piped output. Refused for read-only connections.
-- `hopsql update` and the `check_for_update` / `update_hopsql` tools: install the latest GitHub release (the tool asks the user to confirm first). `HOPSQL_UPDATE_GITHUB_URL` / `HOPSQL_UPDATE_RAW_URL` point them at a mirror.
+- `hopsql update` and the `check_for_update` / `update_hopsql` tools: install the latest GitHub release (the tool asks the user to confirm first).
 
 - Per-connection access `read-only` / `ask` / `writable`: `ask` has the user approve each write statement in the client. Set it with `hopsql access <mode> (<conn>... | --all)` or the bulk option in `hopsql manage`; running servers apply it on the next call and send `tools/list_changed`. Overrides accept `access` (the older `readOnly` still works).
 
