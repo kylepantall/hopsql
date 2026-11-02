@@ -196,6 +196,8 @@ The CLI reads the same `HOPSQL_*` variables as the server, so export `HOPSQL_CON
 
 The server checks GitHub releases at startup, at most once a day, and prints a notice on stderr when a newer one exists (`HOPSQL_UPDATE_NOTIFIER=false` turns this off). Models can call `check_for_update`, then `update_hopsql`. The latter asks you to confirm in the client before downloading anything, and refuses clients that can't ask. Updates only apply to copies installed by `install.sh`/`install.ps1`. Restart your MCP clients afterwards.
 
+**Releasing:** bump `version` in `package.json` (and move the CHANGELOG's Unreleased notes under it) in a PR. Merging it to `main` tags `v<version>` and publishes the GitHub release, which installs then pick up. Pushing a `v*` tag by hand works too, as long as it matches `package.json`.
+
 ## One server, many instances
 
 Register Hopsql once. Select `connectionId` in each tool call; select `database` to switch databases on PostgreSQL, MySQL/MariaDB, SQL Server, or ClickHouse. Each instance can have its own read-only setting, table policy, credentials, timeout, row/byte limits, and pool size.

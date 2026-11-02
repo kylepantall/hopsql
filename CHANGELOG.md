@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-02
+
 ### Added
 
 - SSM `targetName`: find the bastion by its `Name` tag on every (re)connect.
