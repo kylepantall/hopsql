@@ -1,7 +1,11 @@
 name: Release
 
+# Bump "version" in package.json in a PR; merging it to main tags v<version>
+# and publishes the release. Pushing a v* tag by hand still releases it too.
 on:
   push:
+    branches:
+      - main
     tags:
       - 'v*'
   workflow_dispatch:
@@ -14,8 +18,58 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
+  tag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+      release: ${{ steps.version.outputs.release }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+
+      - name: Pick the tag, creating it when main has a new version
+        id: version
+        env:
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ -n "$INPUT_TAG" ]; then
+            tag="$INPUT_TAG"
+          elif [ "$REF_TYPE" = tag ]; then
+            tag="$REF_NAME"
+          else
+            tag="v$version"
+            if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null; then
+              echo "$tag already exists; nothing to release."
+              echo "release=false" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # A tag pushed with GITHUB_TOKEN starts no workflow, so the release
+            # job below publishes it instead of the tag trigger.
+            git tag "$tag" "$GITHUB_SHA"
+            git push origin "$tag"
+          fi
+          # Update checks compare package.json with the tag; they must agree.
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::Tag $tag does not match package.json version $version"
+            exit 1
+          fi
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "release=true" >> "$GITHUB_OUTPUT"
+
   release:
+    needs: tag
+    if: needs.tag.outputs.release == 'true'
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -23,7 +77,7 @@ jobs:
       - name: Checkout release
         uses: actions/checkout@v4
         with:
-          ref: ${{ inputs.tag || github.ref }}
+          ref: ${{ needs.tag.outputs.tag }}
 
       - uses: actions/setup-node@v4
         with:
@@ -48,7 +102,7 @@ jobs:
       - name: Create or update GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ inputs.tag || github.ref_name }}
+          tag_name: ${{ needs.tag.outputs.tag }}
           generate_release_notes: true
           files: release/*.tgz
           fail_on_unmatched_files: true
