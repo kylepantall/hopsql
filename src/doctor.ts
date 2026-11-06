@@ -10,6 +10,7 @@ import { spawnSync } from 'node:child_process';
 import { isIamAuthConnection, awsCliPath } from './auth/iam-auth.js';
 import { clientInvocation } from './install.js';
 import { resolveWindowsCommand } from './net/ssm.js';
+import { dockerPath } from './net/vpn-docker.js';
 import { sqlDialect } from './policy/analyzer.js';
 import {
   dumpFlavorFor,
@@ -125,6 +126,17 @@ export const TOOLS: ToolSpec[] = [
       'brew install awscli',
       'see https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html',
       'winget install Amazon.AWSCLI'
+    ),
+  },
+  {
+    name: 'docker',
+    feature: 'VPNs run in a container (vpn provider "docker")',
+    locate: () => probe(dockerPath(), '--version'),
+    needs: (c) => c.vpn?.provider === 'docker',
+    hint: by(
+      'brew install --cask docker',
+      'see https://docs.docker.com/engine/install/',
+      'winget install Docker.DockerDesktop'
     ),
   },
   {

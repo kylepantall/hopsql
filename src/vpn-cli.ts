@@ -9,12 +9,17 @@ import {
   saveManagedOverrides,
 } from './connections-config.js';
 import { importOpenVpnProfile, listOpenVpnProfiles, matchProfile } from './net/vpn.js';
+import fs from 'node:fs';
+import path from 'node:path';
 import type { ConnectionOverride, DatabaseConnection, VpnConfig } from './types.js';
 
 export const VPN_USAGE =
   'Usage: hopsql vpn list                                List OpenVPN Connect profiles and connections using a VPN\n' +
   '       hopsql vpn import <file.ovpn> [--name <name>]  Import a profile into OpenVPN Connect\n' +
-  '       hopsql vpn use <profile> <connection>...       Bring that OpenVPN Connect profile up for these connections\n' +
+  '       hopsql vpn use <profile> <connection>... [--docker]\n' +
+  '                                                      Bring that profile up for these connections; --docker runs it\n' +
+  '                                                      in a container so only hopsql uses the VPN. <profile> may be\n' +
+  '                                                      an OpenVPN Connect profile, or an .ovpn file with --docker\n' +
   '       hopsql vpn clear <connection>...               Stop using a VPN for these connections';
 
 /** Set or remove a connection's VPN in the managed file, keeping its other settings. */
@@ -44,6 +49,12 @@ function pick(connections: DatabaseConnection[], targets: string[]): DatabaseCon
   return connections.filter((c) => targets.includes(c.id) || targets.includes(c.name));
 }
 
+function describeVpn(vpn: VpnConfig): string {
+  if (vpn.provider === 'openvpn-connect') return `OpenVPN Connect: ${vpn.profile}`;
+  if (vpn.provider === 'docker') return `docker: ${vpn.profile ?? vpn.config}`;
+  return `command: ${vpn.up.join(' ')}`;
+}
+
 export async function runVpnCommand(
   args: string[],
   loadConnections: () => Promise<DatabaseConnection[]>,
@@ -61,10 +72,7 @@ export async function runVpnCommand(
     }
     const using = (await loadConnections()).filter((c) => c.vpn);
     say('Connections using a VPN:');
-    for (const c of using)
-      say(
-        `  ${c.id}\t${c.vpn!.provider === 'openvpn-connect' ? c.vpn!.profile : `command: ${c.vpn!.up.join(' ')}`}`
-      );
+    for (const c of using) say(`  ${c.id}\t${describeVpn(c.vpn!)}`);
     if (using.length === 0) say('  (none)');
     return;
   }
@@ -80,15 +88,24 @@ export async function runVpnCommand(
     return;
   }
   if (action === 'use') {
-    const [wanted, ...targets] = rest;
+    const docker = rest.includes('--docker');
+    const [wanted, ...targets] = rest.filter((arg) => arg !== '--docker');
     if (!wanted) throw new Error(VPN_USAGE);
+    const file = /\.(ovpn|conf)$/i.test(wanted) ? path.resolve(wanted) : undefined;
+    if (file && !docker) throw new Error('An .ovpn file needs --docker; or import it first');
+    if (file && !fs.existsSync(file)) throw new Error('VPN profile file not found');
     // Checked now so a typo fails here, not on the next query. Stored by id,
     // which survives renaming the profile in the app.
-    const profile = matchProfile(await listOpenVpnProfiles(), wanted);
+    const profile = file ? undefined : matchProfile(await listOpenVpnProfiles(), wanted);
     const chosen = pick(await loadConnections(), targets);
-    setVpn(chosen, { provider: 'openvpn-connect', profile: profile.id });
+    const vpn: VpnConfig = !docker
+      ? { provider: 'openvpn-connect', profile: profile!.id }
+      : file
+        ? { provider: 'docker', config: file }
+        : { provider: 'docker', profile: profile!.id };
+    setVpn(chosen, vpn);
     say(
-      `${chosen.length} connection(s) will bring up "${profile.name}" when needed. Running servers apply it on the next call.`
+      `${chosen.length} connection(s) will bring up "${profile?.name ?? path.basename(file!)}"${docker ? ' in a container' : ''} when needed. Running servers apply it on the next call.`
     );
     return;
   }

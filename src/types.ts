@@ -52,6 +52,16 @@ export interface DatabaseConnection {
 export type VpnConfig = (
   | { provider: 'openvpn-connect'; /** Profile id or name in OpenVPN Connect. */ profile: string }
   | {
+      /**
+       * OpenVPN in a local Docker container: only hopsql's connections use it,
+       * through the container's SOCKS proxy. Set exactly one of `config` (an
+       * .ovpn file) or `profile` (an OpenVPN Connect profile id or name).
+       */
+      provider: 'docker';
+      config?: string;
+      profile?: string;
+    }
+  | {
       provider: 'command';
       up: string[];
       down?: string[];

@@ -18,11 +18,15 @@
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import net from 'node:net';
+import os from 'node:os';
 import path from 'node:path';
 import { registerPrivateValue, sanitizeDiagnostic } from '../privacy.js';
 import type { DatabaseConnection, VpnConfig } from '../types.js';
+import { socksAvailable, type SocksProxy } from './socks.js';
+import { containerName, DockerVpn } from './vpn-docker.js';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 60000;
+const DOCKER_CONNECT_TIMEOUT_MS = 120000;
 const PROBE_TIMEOUT_MS = 1500;
 const POLL_INTERVAL_MS = 1000;
 /** A VPN seen up is not probed again for this long. */
@@ -46,7 +50,9 @@ export interface CommandResult {
 export type CommandRunner = (
   command: string,
   args: string[],
-  timeoutMs: number
+  timeoutMs: number,
+  /** Written to the command's stdin. */
+  input?: string
 ) => Promise<CommandResult>;
 
 /** A started `up` command, which may be a one-shot or a long-running client. */
@@ -65,14 +71,19 @@ function append(current: string, chunk: Buffer): string {
   return current.length >= OUTPUT_LIMIT ? current : current + chunk.toString('utf8');
 }
 
-export const runCommand: CommandRunner = (command, args, timeoutMs) =>
+export const runCommand: CommandRunner = (command, args, timeoutMs, input) =>
   new Promise((resolve, reject) => {
-    const child = spawn(command, args, { stdio: ['ignore', 'pipe', 'pipe'], windowsHide: true });
+    const child = spawn(command, args, {
+      stdio: [input === undefined ? 'ignore' : 'pipe', 'pipe', 'pipe'],
+      windowsHide: true,
+    });
+    child.stdin?.on('error', () => {});
+    child.stdin?.end(input);
     let stdout = '';
     let stderr = '';
     let timedOut = false;
-    child.stdout.on('data', (chunk: Buffer) => (stdout = append(stdout, chunk)));
-    child.stderr.on('data', (chunk: Buffer) => (stderr = append(stderr, chunk)));
+    child.stdout!.on('data', (chunk: Buffer) => (stdout = append(stdout, chunk)));
+    child.stderr!.on('data', (chunk: Buffer) => (stderr = append(stderr, chunk)));
     const timer = setTimeout(() => {
       timedOut = true;
       child.kill();
@@ -185,6 +196,19 @@ function installedOpenVpnConnect(): string {
   return exe;
 }
 
+/** Where OpenVPN Connect keeps an imported profile's .ovpn file. */
+export function openVpnConnectProfileFile(
+  id: string,
+  env: NodeJS.ProcessEnv = process.env,
+  platform: NodeJS.Platform = process.platform
+): string {
+  const base =
+    platform === 'win32'
+      ? path.join(env.APPDATA || path.join(os.homedir(), 'AppData', 'Roaming'), 'OpenVPN Connect')
+      : path.join(os.homedir(), 'Library', 'Application Support', 'OpenVPN Connect');
+  return path.join(base, 'profiles', `${id}.ovpn`);
+}
+
 /** `--list-profiles` prints a JSON array; anything else means an older app. */
 export function parseProfileList(stdout: string): OpenVpnProfile[] {
   const start = stdout.indexOf('[');
@@ -256,16 +280,28 @@ export async function importOpenVpnProfile(
 
 // --- Manager -----------------------------------------------------------------
 
-function vpnKey(vpn: VpnConfig): string {
+type HostVpn = Exclude<VpnConfig, { provider: 'docker' }>;
+type DockerVpnConfig = Extract<VpnConfig, { provider: 'docker' }>;
+
+function vpnKey(vpn: HostVpn): string {
   return vpn.provider === 'openvpn-connect'
     ? `openvpn-connect:${vpn.profile}`
     : `command:${JSON.stringify(vpn.up)}`;
 }
 
-function describe(vpn: VpnConfig): string {
+function describe(vpn: HostVpn): string {
   return vpn.provider === 'openvpn-connect'
     ? `OpenVPN Connect profile "${vpn.profile}"`
     : `VPN command "${vpn.up[0]}"`;
+}
+
+function expandHome(file: string): string {
+  return file.startsWith('~/') ? path.join(os.homedir(), file.slice(2)) : file;
+}
+
+/** True for a VPN only hopsql's connections use, dialled through its SOCKS proxy. */
+export function usesVpnProxy(connection: DatabaseConnection): boolean {
+  return connection.vpn?.provider === 'docker';
 }
 
 export interface VpnManagerOptions {
@@ -275,6 +311,8 @@ export interface VpnManagerOptions {
   sleep?: (ms: number) => Promise<void>;
   now?: () => number;
   pollIntervalMs?: number;
+  docker?: DockerVpn;
+  socksReady?: (proxy: SocksProxy) => Promise<boolean>;
 }
 
 export class VpnManager {
@@ -287,7 +325,13 @@ export class VpnManager {
   private pending = new Map<string, Promise<void>>();
   private upUntil = new Map<string, number>();
   /** VPNs this process brought up, to take down again on exit. */
-  private started = new Map<string, VpnConfig>();
+  private started = new Map<string, HostVpn>();
+  private readonly docker: DockerVpn;
+  private readonly socksReady: (proxy: SocksProxy) => Promise<boolean>;
+  private proxies = new Map<string, { proxy: SocksProxy; checkedUntil: number }>();
+  private pendingProxies = new Map<string, Promise<SocksProxy>>();
+  /** Containers this process started, removed on exit. */
+  private containers = new Set<string>();
   private debug = false;
 
   constructor(options: VpnManagerOptions = {}) {
@@ -297,6 +341,8 @@ export class VpnManager {
     this.sleep = options.sleep ?? ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
     this.now = options.now ?? Date.now;
     this.pollIntervalMs = options.pollIntervalMs ?? POLL_INTERVAL_MS;
+    this.docker = options.docker ?? new DockerVpn(this.runner);
+    this.socksReady = options.socksReady ?? ((proxy) => socksAvailable(proxy, PROBE_TIMEOUT_MS));
   }
 
   setDebug(debug: boolean): void {
@@ -311,6 +357,7 @@ export class VpnManager {
   async ensure(connection: DatabaseConnection, defaultPort: number): Promise<void> {
     const vpn = connection.vpn;
     if (!vpn) return;
+    if (vpn.provider === 'docker') return void (await this.proxyFor(connection));
     if (vpn.provider === 'openvpn-connect') registerPrivateValue(vpn.profile);
     const key = vpnKey(vpn);
     if ((this.upUntil.get(key) ?? 0) > this.now()) return;
@@ -323,7 +370,7 @@ export class VpnManager {
     return work;
   }
 
-  private async isUp(vpn: VpnConfig, target: ProbeTarget | null): Promise<boolean> {
+  private async isUp(vpn: HostVpn, target: ProbeTarget | null): Promise<boolean> {
     if (vpn.provider === 'command' && vpn.check) {
       const result = await this.runner(vpn.check[0], vpn.check.slice(1), COMMAND_TIMEOUT_MS).catch(
         () => undefined
@@ -333,13 +380,13 @@ export class VpnManager {
     return target ? this.probe(target, PROBE_TIMEOUT_MS) : false;
   }
 
-  private async start(vpn: VpnConfig): Promise<Launched> {
+  private async start(vpn: HostVpn): Promise<Launched> {
     if (vpn.provider === 'command') return this.launcher(vpn.up[0], vpn.up.slice(1));
     const profile = matchProfile(await listOpenVpnProfiles(this.runner), vpn.profile);
     return this.launcher(installedOpenVpnConnect(), [`--connect-shortcut=${profile.id}`]);
   }
 
-  private async bringUp(key: string, vpn: VpnConfig, target: ProbeTarget | null): Promise<void> {
+  private async bringUp(key: string, vpn: HostVpn, target: ProbeTarget | null): Promise<void> {
     const markUp = () => this.upUntil.set(key, this.now() + UP_CACHE_MS);
     const checkable = target !== null || (vpn.provider === 'command' && vpn.check !== undefined);
     if (await this.isUp(vpn, target)) return void markUp();
@@ -379,11 +426,108 @@ export class VpnManager {
     markUp();
   }
 
+  /** The .ovpn file a docker VPN runs: its own path, or an OpenVPN Connect profile's. */
+  private async dockerProfileFile(vpn: DockerVpnConfig): Promise<string> {
+    if (vpn.config) {
+      const file = expandHome(vpn.config);
+      if (!fs.existsSync(file)) throw new Error('The VPN profile file (vpn.config) does not exist');
+      return file;
+    }
+    const wanted = vpn.profile!;
+    registerPrivateValue(wanted);
+    const direct = openVpnConnectProfileFile(wanted);
+    if (/^\d+$/.test(wanted) && fs.existsSync(direct)) return direct;
+    const profile = matchProfile(await listOpenVpnProfiles(this.runner), wanted);
+    const file = openVpnConnectProfileFile(profile.id);
+    if (!fs.existsSync(file))
+      throw new Error(`OpenVPN Connect has no stored file for profile ${profile.id}`);
+    return file;
+  }
+
+  /**
+   * The SOCKS proxy of the connection's VPN container, starting the container
+   * if it is not running. A container another server started for the same
+   * profile is reused, and left running on exit.
+   */
+  async proxyFor(connection: DatabaseConnection): Promise<SocksProxy> {
+    const vpn = connection.vpn;
+    if (vpn?.provider !== 'docker') throw new Error('Connection has no docker VPN');
+    if (connection.ssm)
+      throw new Error(
+        `Connection "${connection.name}" uses SSM, which reaches AWS directly; a docker VPN cannot carry it`
+      );
+    const file = await this.dockerProfileFile(vpn);
+    const name = containerName(file);
+    const cached = this.proxies.get(name);
+    if (cached && cached.checkedUntil > this.now()) return cached.proxy;
+    const inFlight = this.pendingProxies.get(name);
+    if (inFlight) return inFlight;
+    const work = this.startContainer(name, file, vpn).finally(() =>
+      this.pendingProxies.delete(name)
+    );
+    this.pendingProxies.set(name, work);
+    return work;
+  }
+
+  private async startContainer(
+    name: string,
+    file: string,
+    vpn: DockerVpnConfig
+  ): Promise<SocksProxy> {
+    await this.docker.assertAvailable();
+    let startedHere = false;
+    if (!(await this.docker.running(name))) {
+      this.proxies.delete(name);
+      this.log('starting container', { name });
+      await this.docker.ensureImage();
+      await this.docker.start(name, file);
+      startedHere = true;
+      if (vpn.disconnectOnExit !== false) this.containers.add(name);
+    }
+    try {
+      return await this.awaitProxy(name, vpn);
+    } catch (error) {
+      // A container that never connected is not left retrying in the background.
+      if (startedHere) {
+        this.containers.delete(name);
+        await this.docker.remove(name).catch(() => {});
+      }
+      throw error;
+    }
+  }
+
+  private async awaitProxy(name: string, vpn: DockerVpnConfig): Promise<SocksProxy> {
+    // Longer by default: openvpn backs off between attempts (16s, 32s, ...).
+    const deadline = this.now() + (vpn.connectTimeoutMs ?? DOCKER_CONNECT_TIMEOUT_MS);
+    for (;;) {
+      if (!(await this.docker.running(name)))
+        throw new Error(`The VPN container stopped: ${await this.docker.failure(name)}`);
+      const proxy = await this.docker.proxy(name);
+      if (proxy && (await this.socksReady(proxy))) {
+        this.proxies.set(name, { proxy, checkedUntil: this.now() + UP_CACHE_MS });
+        this.log('container ready', { name });
+        return proxy;
+      }
+      if (this.now() >= deadline)
+        throw new Error(
+          `The VPN container did not connect before the timeout: ${await this.docker.failure(name)}`
+        );
+      await this.sleep(this.pollIntervalMs);
+    }
+  }
+
   /** Take down every VPN this process brought up. Failures are logged, not thrown. */
   async disconnectAll(): Promise<void> {
     const started = [...this.started.values()];
     this.started.clear();
     this.upUntil.clear();
+    const containers = [...this.containers];
+    this.containers.clear();
+    this.proxies.clear();
+    for (const name of containers)
+      await this.docker
+        .remove(name)
+        .catch((error) => this.log('container removal failed', { name, error: String(error) }));
     for (const vpn of started) {
       try {
         if (vpn.provider === 'openvpn-connect')

@@ -33,7 +33,8 @@ import {
   startSsmSession,
   type SsmSession,
 } from './ssm.js';
-import { vpnManager } from './vpn.js';
+import { socksConnect, type SocksProxy } from './socks.js';
+import { usesVpnProxy, vpnManager } from './vpn.js';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 20000;
 
@@ -50,12 +51,18 @@ export interface TunnelEndpoint {
 
 interface ActiveTunnel extends TunnelEndpoint {
   alive: boolean;
+  /** The VPN proxy it dials through; a different one means the tunnel is stale. */
+  via?: string;
   close: () => Promise<void>;
 }
 
 /** True when the recorded host/port are reached through a local forward. */
 export function isTunneled(connection: DatabaseConnection): boolean {
-  return connection.sshTunnel?.enabled === true || connection.ssm !== undefined;
+  return (
+    connection.sshTunnel?.enabled === true ||
+    connection.ssm !== undefined ||
+    usesVpnProxy(connection)
+  );
 }
 
 const CONNECTION_ERROR_CODES = new Set([
@@ -272,11 +279,12 @@ export class SshTunnelManager {
     config: SshTunnelConfig | undefined,
     destHost: string,
     destPort: number,
-    preferredPort?: number
+    preferredPort?: number,
+    proxy?: SocksProxy
   ): Promise<ActiveTunnel> {
     for (let approvals = 0; ; approvals += 1) {
       try {
-        return await this.open(connection, config, destHost, destPort, preferredPort);
+        return await this.open(connection, config, destHost, destPort, preferredPort, proxy);
       } catch (error) {
         const prompt = this.hostKeyPrompt;
         if (
@@ -326,14 +334,18 @@ export class SshTunnelManager {
   ): Promise<TunnelEndpoint | null> {
     registerConnectionPrivacy(connection);
     // Every path that dials a connection comes through here, tunneled or not.
-    // A live tunnel proves the VPN under it is still up.
-    if (connection.vpn && !this.tunnels.get(connection.id)?.alive)
+    // A docker VPN is dialled through its proxy; for a host VPN, a live tunnel
+    // proves the VPN under it is still up.
+    let proxy: SocksProxy | undefined;
+    if (usesVpnProxy(connection)) proxy = await vpnManager.proxyFor(connection);
+    else if (connection.vpn && !this.tunnels.get(connection.id)?.alive)
       await vpnManager.ensure(connection, defaultPort);
     const config = connection.sshTunnel;
     const ssm = connection.ssm;
-    if (!ssm && (!config || !config.enabled)) {
+    if (!ssm && !config?.enabled && !proxy) {
       return null;
     }
+    const via = proxy ? `${proxy.host}:${proxy.port}` : undefined;
 
     const key = connection.id;
     const endpoint = (tunnel: ActiveTunnel): TunnelEndpoint => ({
@@ -342,7 +354,7 @@ export class SshTunnelManager {
       generation: tunnel.generation,
     });
     const existing = this.tunnels.get(key);
-    if (existing?.alive) {
+    if (existing?.alive && existing.via === via) {
       return endpoint(existing);
     }
 
@@ -364,13 +376,16 @@ export class SshTunnelManager {
     const creation = (async () => {
       // Release the old listener first so its port can be rebound.
       if (existing) await existing.close().catch(() => {});
-      return ssm?.mode === 'port-forward'
-        ? this.openPortForward(connection, ssm, destHost, destPort, preferredPort)
-        : this.openWithApproval(connection, config, destHost, destPort, preferredPort);
+      if (ssm?.mode === 'port-forward')
+        return this.openPortForward(connection, ssm, destHost, destPort, preferredPort);
+      if (proxy && !config?.enabled)
+        return this.openSocksForward(connection, proxy, destHost, destPort, preferredPort);
+      return this.openWithApproval(connection, config, destHost, destPort, preferredPort, proxy);
     })();
     this.pending.set(key, creation);
     try {
       const tunnel = await creation;
+      tunnel.via = via;
       tunnel.generation = (this.generations.get(key) ?? 0) + 1;
       this.generations.set(key, tunnel.generation);
       this.lastPorts.set(key, tunnel.port);
@@ -379,6 +394,75 @@ export class SshTunnelManager {
     } finally {
       this.pending.delete(key);
     }
+  }
+
+  /**
+   * A loopback listener whose connections are carried to the database by a
+   * docker VPN's SOCKS proxy, for connections with no SSH tunnel.
+   */
+  private async openSocksForward(
+    connection: DatabaseConnection,
+    proxy: SocksProxy,
+    destHost: string,
+    destPort: number,
+    preferredPort: number | undefined
+  ): Promise<ActiveTunnel> {
+    const sockets = new Set<net.Socket>();
+    const timeoutMs = connection.vpn?.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS;
+    const server = net.createServer((socket) => {
+      sockets.add(socket);
+      socket.on('close', () => sockets.delete(socket));
+      socket.on('error', () => socket.destroy());
+      socket.pause();
+      socksConnect(proxy, destHost, destPort, timeoutMs).then(
+        (upstream) => {
+          sockets.add(upstream);
+          upstream.on('close', () => sockets.delete(upstream));
+          upstream.on('error', () => socket.destroy());
+          socket.on('error', () => upstream.destroy());
+          socket.on('close', () => upstream.destroy());
+          upstream.on('close', () => socket.destroy());
+          socket.pipe(upstream).pipe(socket);
+        },
+        (error: Error) => {
+          this.log(`VPN forward to ${destHost}:${destPort} failed: ${error.message}`);
+          socket.destroy();
+        }
+      );
+    });
+    const bind = (port: number) =>
+      new Promise<number>((resolve, reject) => {
+        server.once('error', reject);
+        // Loopback only: anything reaching this port reaches the database.
+        server.listen(port, '127.0.0.1', () => {
+          server.removeListener('error', reject);
+          const address = server.address();
+          if (address && typeof address === 'object') resolve(address.port);
+          else reject(new Error('Failed to allocate a local port for the VPN forward'));
+        });
+      });
+    let localPort: number;
+    try {
+      localPort = await bind(preferredPort ?? 0);
+    } catch (error) {
+      if (!preferredPort) throw error;
+      localPort = await bind(0);
+    }
+    this.log(`VPN forward up for "${connection.name}" on 127.0.0.1:${localPort}`);
+    const tunnel: ActiveTunnel = {
+      alive: true,
+      host: '127.0.0.1',
+      port: localPort,
+      close: async () => {
+        tunnel.alive = false;
+        for (const socket of sockets) socket.destroy();
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      },
+    };
+    server.on('error', () => {
+      tunnel.alive = false;
+    });
+    return tunnel;
   }
 
   /** SSM port forwarding: the plugin itself is the local listener. */
@@ -420,7 +504,8 @@ export class SshTunnelManager {
     config: SshTunnelConfig | undefined,
     destHost: string,
     destPort: number,
-    preferredPort?: number
+    preferredPort?: number,
+    proxy?: SocksProxy
   ): Promise<ActiveTunnel> {
     if (!config?.enabled) {
       throw new Error(
@@ -471,6 +556,14 @@ export class SshTunnelManager {
             ssmArgs(ssm, 'AWS-StartSSHSession', { portNumber: String(hop.port) })
           );
           sock = childStream(session.child);
+        } else if (proxy) {
+          // The first hop is reached through the docker VPN's proxy.
+          sock = await socksConnect(
+            proxy,
+            hop.host,
+            hop.port,
+            hop.connectTimeoutMs ?? DEFAULT_CONNECT_TIMEOUT_MS
+          );
         }
         clients.push(
           await this.connectHop(

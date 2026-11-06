@@ -111,8 +111,8 @@ Usage: hopsql                 Manage connections (in a terminal; MCP clients get
        hopsql query <connection> (<sql> | --file <query.sql>) [--write] [--database <name>] [--max-rows <n>]
        hopsql exec <connection> [--database <name>] -- <command> [args...]
                               Run a tool (psql, mysql, migrations) with the connection's credentials in its env
-       hopsql vpn [list | import <file.ovpn> [--name <name>] | use <profile> <connection>... | clear <connection>...]
-                              Bring a VPN (OpenVPN Connect) up automatically for connections that need it
+       hopsql vpn [list | import <file.ovpn> [--name <name>] | use <profile> <connection>... [--docker] | clear <connection>...]
+                              Bring a VPN up automatically for connections that need it; --docker keeps it to hopsql
        hopsql update [--check] [--yes] [--json]
                               Install the latest GitHub release
 
@@ -143,6 +143,7 @@ Environment Variables:
   HOPSQL_SSH_KNOWN_HOSTS      known_hosts used to verify SSH tunnel hosts (default: ~/.ssh/known_hosts)
   HOPSQL_SSH_STRICT_HOST_KEY  Refuse SSH tunnel hosts with no known_hosts entry (default: true)
   HOPSQL_OPENVPN_CONNECT      Path to the OpenVPN Connect executable, if not installed in the default place
+  HOPSQL_DOCKER_PATH          Path to the docker CLI, for VPNs run in a container
 
 Features:
   - Direct database instances with independent permissions; optional saved-workspace import

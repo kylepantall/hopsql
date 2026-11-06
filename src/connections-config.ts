@@ -142,10 +142,13 @@ export function parseVpn(value: unknown, label: string): VpnConfig {
   const own =
     vpn.provider === 'openvpn-connect'
       ? ['profile']
-      : vpn.provider === 'command'
-        ? ['up', 'down', 'check']
-        : undefined;
-  if (!own) throw new Error(`${label}: vpn.provider must be "openvpn-connect" or "command"`);
+      : vpn.provider === 'docker'
+        ? ['config', 'profile']
+        : vpn.provider === 'command'
+          ? ['up', 'down', 'check']
+          : undefined;
+  if (!own)
+    throw new Error(`${label}: vpn.provider must be "openvpn-connect", "docker" or "command"`);
   if (Object.keys(vpn).some((k) => !shared.includes(k) && !own.includes(k)))
     throw new Error(`${label}: unknown vpn setting`);
   if (
@@ -165,16 +168,36 @@ export function parseVpn(value: unknown, label: string): VpnConfig {
       ? {}
       : { disconnectOnExit: vpn.disconnectOnExit as boolean }),
   };
+  const profileName = (value: unknown): value is string =>
+    typeof value === 'string' &&
+    Boolean(value.trim()) &&
+    value.length <= 512 &&
+    !value.startsWith('-') &&
+    !/[\0\r\n]/.test(value);
   if (vpn.provider === 'openvpn-connect') {
-    if (
-      typeof vpn.profile !== 'string' ||
-      !vpn.profile.trim() ||
-      vpn.profile.length > 512 ||
-      vpn.profile.startsWith('-') ||
-      /[\0\r\n]/.test(vpn.profile)
-    )
+    if (!profileName(vpn.profile))
       throw new Error(`${label}: vpn.profile must be an OpenVPN Connect profile name or id`);
     return { provider: 'openvpn-connect', profile: vpn.profile, ...common };
+  }
+  if (vpn.provider === 'docker') {
+    if ((vpn.config === undefined) === (vpn.profile === undefined))
+      throw new Error(`${label}: set exactly one of vpn.config or vpn.profile`);
+    if (vpn.profile !== undefined && !profileName(vpn.profile))
+      throw new Error(`${label}: vpn.profile must be an OpenVPN Connect profile name or id`);
+    if (
+      vpn.config !== undefined &&
+      (typeof vpn.config !== 'string' ||
+        !(isAbsolute(vpn.config) || vpn.config.startsWith('~/')) ||
+        // Becomes the source of a docker --mount spec, which ',' would split.
+        /[\0\r\n,]/.test(vpn.config))
+    )
+      throw new Error(`${label}: vpn.config must be an absolute path to an .ovpn file`);
+    return {
+      provider: 'docker',
+      ...(vpn.config === undefined ? {} : { config: vpn.config as string }),
+      ...(vpn.profile === undefined ? {} : { profile: vpn.profile as string }),
+      ...common,
+    };
   }
   return {
     provider: 'command',

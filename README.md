@@ -435,6 +435,18 @@ hopsql vpn list                                        # profiles, and which con
 hopsql vpn clear orders-db
 ```
 
+**Only hopsql through the VPN (Docker):** add `--docker` and the profile runs in a local
+container instead. Your Mac's routing is untouched, so the browser and other apps stay off the
+VPN. hopsql dials through the container's SOCKS proxy (published on loopback only), both for
+direct connections and for the first hop of an SSH tunnel. Needs Docker running. The image is
+built locally on first use from a digest-pinned Alpine base with `openvpn` and `dante`.
+Certificate-based profiles only (no password, SAML or MFA prompts). Not available with SSM.
+
+```bash
+hopsql vpn use Work orders-db --docker              # an imported OpenVPN Connect profile
+hopsql vpn use ~/vpn/work.ovpn orders-db --docker   # or any .ovpn file
+```
+
 Any other client: give the argv to bring it up and down (no shell), plus an optional `check`
 whose exit status 0 means "up". Set it under `overrides` or on a configured connection:
 
@@ -448,7 +460,8 @@ whose exit status 0 means "up". Set it under `overrides` or on a configured conn
 
 | ⚠️ Caveat | Why |
 |---|---|
-| The VPN is machine-wide | It changes routing for every app, not just hopsql |
+| The VPN is machine-wide (except `--docker`) | It changes routing for every app, not just hopsql |
+| The Docker proxy is reachable from your machine | Any local process can use `127.0.0.1:<port>` to reach the VPN while the container runs |
 | OpenVPN Connect holds one profile at a time | Connections that need different profiles will drop each other's VPN |
 | A database that's down looks like the VPN is down | hopsql starts the VPN, then times out with a message that says so |
 | Several hopsql servers share one VPN | The server that started it disconnects it when it exits |
