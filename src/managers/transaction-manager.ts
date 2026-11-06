@@ -1,6 +1,7 @@
 import { registerConnectionPrivacy, sanitizeDiagnostic } from '../privacy.js';
 import { assertQueryAccess } from '../policy/identities.js';
 import { validateStatement } from '../policy/sql.js';
+import { scriptDdlError } from '../runtime/script.js';
 import { AccessPolicy } from '../policy/access.js';
 import { randomBytes } from 'node:crypto';
 import { connectionFingerprint as fingerprint } from '../runtime/connection-identity.js';
@@ -289,6 +290,8 @@ export class TransactionManager {
       for (const [index, statement] of statements.entries()) {
         let result: QueryResult;
         try {
+          const ddlError = scriptDdlError(statement);
+          if (ddlError) throw new Error(ddlError);
           result = await this.executeInTransaction(transactionId, statement, allowed);
         } catch (error) {
           const ddl = type === 'mysql' && /^\s*(create|alter|drop)\b/i.test(statement);

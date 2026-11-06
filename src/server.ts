@@ -88,7 +88,11 @@ import { ConnectionPoolManager } from './pools/index.js';
 import { sshTunnelManager, type HostKeyQuestion } from './net/ssh-tunnel.js';
 import { vpnManager } from './net/vpn.js';
 import { TransactionManager } from './managers/index.js';
-import { describeScriptForApproval, scriptStatements } from './runtime/script.js';
+import {
+  describeScriptForApproval,
+  MAX_APPROVAL_CHARS,
+  scriptStatements,
+} from './runtime/script.js';
 import { buildExplainQuery, parseExplainOutput } from './utils/query-analyzer.js';
 import { compareSchemas, comparableSchema, generateMigrationScript } from './utils/schema-diff.js';
 import fs from 'fs';
@@ -1767,12 +1771,17 @@ export class HopsqlMCPServer {
       throw new McpError(ErrorCode.InvalidParams, `Connection not found: ${connectionId}`);
     }
     this.assertNotReadOnly(connection);
-    if (connection.askBeforeWrite)
-      await this.askApproval(
-        connection,
-        describeScriptForApproval(statements, text, args.file),
-        `Run all ${statements.length} statements`
-      );
+    if (connection.askBeforeWrite) {
+      // The user approves exactly what runs, so a script too long to show is
+      // refused rather than shortened.
+      const shown = describeScriptForApproval(statements, text, args.file);
+      if (!shown)
+        throw new McpError(
+          ErrorCode.InvalidRequest,
+          `Script is too long to show for approval (limit ${MAX_APPROVAL_CHARS} characters); split it into several run_script calls`
+        );
+      await this.askApproval(connection, shown, `Run all ${statements.length} statements`);
+    }
     const started = Date.now();
     let results;
     try {

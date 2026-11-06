@@ -2,7 +2,11 @@ import { afterEach, describe, expect, it, vi, mock } from 'bun:test';
 import { TransactionManager, ScriptStatementError } from '../src/managers/transaction-manager.js';
 import { splitSqlScript, validateStatement } from '../src/policy/sql.js';
 import { AccessPolicy } from '../src/policy/access.js';
-import { describeScriptForApproval, scriptStatements } from '../src/runtime/script.js';
+import {
+  describeScriptForApproval,
+  scriptDdlError,
+  scriptStatements,
+} from '../src/runtime/script.js';
 import type { DatabaseConnection } from '../src/types.js';
 import type { ConnectionPoolManager } from '../src/pools/connection-pool.js';
 import { readPostgres } from '../src/runtime/sql-sessions.js';
@@ -106,20 +110,52 @@ describe('DO blocks', () => {
 describe('describeScriptForApproval', () => {
   it('shows short scripts in full with counts and a hash', () => {
     const text = 'UPDATE t SET a=1 WHERE id=1; INSERT INTO t VALUES (2)';
-    const shown = describeScriptForApproval(scriptStatements(text), text, '/m.sql');
+    const shown = describeScriptForApproval(scriptStatements(text), text, '/m.sql')!;
     expect(shown).toContain('UPDATE t SET a=1 WHERE id=1');
     expect(shown).toContain('INSERT INTO t VALUES (2)');
     expect(shown).toContain('/m.sql');
   });
 
-  it('shortens each statement of a long script but lists every one', () => {
+  it('never shortens: a script too long to show in full is not described', () => {
     const statements = Array.from(
-      { length: 40 },
+      { length: 100 },
       (_, i) => `UPDATE t SET a = '${'x'.repeat(200)}' WHERE id = ${i}`
     );
-    const shown = describeScriptForApproval(statements, statements.join(';'));
-    expect(shown.length).toBeLessThan(statements.join(';').length);
-    for (let i = 1; i <= 40; i++) expect(shown).toContain(`\n${i}. UPDATE`);
+    expect(describeScriptForApproval(statements, statements.join(';'))).toBeNull();
+  });
+
+  it('keeps line breaks, so a line comment cannot hide the next line', () => {
+    const statement = 'DELETE FROM t WHERE id = 1 --\nOR true';
+    const shown = describeScriptForApproval([statement], statement)!;
+    expect(shown).toContain('\n   OR true');
+  });
+});
+
+describe('scriptDdlError', () => {
+  it('allows schema objects and refuses code and security objects', () => {
+    for (const ok of [
+      'CREATE TABLE IF NOT EXISTS x (id int)',
+      'CREATE UNIQUE INDEX i ON x (id)',
+      'CREATE OR REPLACE VIEW v AS SELECT 1',
+      'CREATE MATERIALIZED VIEW m AS SELECT 1',
+      'ALTER TABLE x ADD COLUMN y int',
+      'DROP SEQUENCE IF EXISTS s',
+      'UPDATE x SET y = 1 WHERE id = 1',
+    ])
+      expect(scriptDdlError(ok)).toBeNull();
+    for (const refused of [
+      'CREATE FUNCTION f() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NULL; END $$',
+      'CREATE OR REPLACE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql',
+      'CREATE TRIGGER tr AFTER INSERT ON x FOR EACH ROW EXECUTE FUNCTION f()',
+      'CREATE ROLE admin LOGIN SUPERUSER',
+      'CREATE EXTENSION dblink',
+      'ALTER ROLE admin SUPERUSER',
+      'CREATE RULE r AS ON INSERT TO x DO INSTEAD NOTHING',
+    ])
+      expect(scriptDdlError(refused)).not.toBeNull();
+    expect(() =>
+      scriptStatements('CREATE FUNCTION f() RETURNS int AS $$ SELECT 1 $$ LANGUAGE sql')
+    ).toThrow();
   });
 });
 
@@ -154,6 +190,19 @@ describe('TransactionManager.runScript', () => {
     expect(client.query.mock.calls.map((c) => c[0])).not.toContain('COMMIT');
     expect(client.release).toHaveBeenCalledWith(true);
     expect(manager.getActiveTransactions()).toEqual([]);
+  });
+
+  it('refuses code objects mid-script and rolls back what ran', async () => {
+    const { manager, client } = setup();
+    readPostgres.mockResolvedValue({ columns: [], rows: [], rowCount: 1 });
+    await expect(
+      manager.runScript(connection, [
+        'UPDATE t SET a = 1 WHERE id = 1',
+        'CREATE TRIGGER tr AFTER INSERT ON t FOR EACH ROW EXECUTE FUNCTION f()',
+      ])
+    ).rejects.toBeInstanceOf(ScriptStatementError);
+    expect(readPostgres).toHaveBeenCalledTimes(1);
+    expect(client.query.mock.calls.map((c) => c[0])).toEqual(['BEGIN', 'ROLLBACK']);
   });
 
   it('refuses DDL on MySQL, which would commit implicitly', async () => {

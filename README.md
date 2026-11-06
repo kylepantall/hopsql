@@ -336,7 +336,7 @@ PostgreSQL, MySQL/MariaDB, and SQL Server support explicit transactions. Results
 - `commit_transaction` - Commit a transaction
 - `rollback_transaction` - Roll back a transaction
 
-`run_script` uses the same transaction path, adding DDL where it rolls back (PostgreSQL, SQL Server; not MySQL/MariaDB). A wrapping `BEGIN`/`COMMIT` in the script is optional and dropped. Statements are split at top-level `;`, so procedural bodies must be dollar-quoted (`DO $$ ... $$`); MySQL `DELIMITER` and SQL Server `GO` are not supported. PostgreSQL `DO` blocks also work in `execute_in_transaction`. Their body can't be checked, so they are refused on connections with access policies.
+`run_script` uses the same transaction path. It adds DDL on tables, indexes, views, sequences and types where DDL rolls back (PostgreSQL, SQL Server; not MySQL/MariaDB). Functions, triggers, roles and extensions are refused, because they run or grant things the checks can't see. On `ask` connections the approval shows the whole script, never shortened; a script too long to show must be split into several calls. A wrapping `BEGIN`/`COMMIT` in the script is optional and dropped. Statements are split at top-level `;`, so procedural bodies must be dollar-quoted (`DO $$ ... $$`); MySQL `DELIMITER` and SQL Server `GO` are not supported. PostgreSQL `DO` blocks also work in `execute_in_transaction`. Their body can't be checked, so they are refused on connections with access policies.
 
 ### Query Analysis
 - `explain_query` - Analyze query execution plan
