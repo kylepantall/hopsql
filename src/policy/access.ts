@@ -268,6 +268,10 @@ export class AccessPolicy {
     if (error) throw new Error(error);
     const rules = this.rules(c);
     const restricted = this.isDatabaseScoped(c);
+    if (restricted && sqlTokens(query, sqlDialect(c.driver))[0]?.value === 'do')
+      throw new Error(
+        'DO blocks run code that cannot be checked, so they are disabled while access policies are active'
+      );
     if (!restricted) return;
     if (
       sqlDialect(c.driver) === 'oracle' &&

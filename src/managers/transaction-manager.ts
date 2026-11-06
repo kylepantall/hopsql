@@ -1,6 +1,7 @@
 import { registerConnectionPrivacy, sanitizeDiagnostic } from '../privacy.js';
 import { assertQueryAccess } from '../policy/identities.js';
 import { validateStatement } from '../policy/sql.js';
+import { scriptDdlError } from '../runtime/script.js';
 import { AccessPolicy } from '../policy/access.js';
 import { randomBytes } from 'node:crypto';
 import { connectionFingerprint as fingerprint } from '../runtime/connection-identity.js';
@@ -11,6 +12,43 @@ import type { Transaction, TransactionResult, DatabaseConnection, QueryResult } 
 import { ConnectionPoolManager } from '../pools/connection-pool.js';
 import { readPostgres, readMysql, readSqlServer } from '../runtime/sql-sessions.js';
 import { acquireLease, withDeadline } from '../runtime/lease.js';
+
+/**
+ * What a transaction may run. MySQL DDL commits implicitly, so schema changes
+ * are never promised a rollback here; `run_script` adds them where DDL is
+ * transactional (PostgreSQL, SQL Server).
+ */
+const TRANSACTION_STATEMENTS = [
+  'select',
+  'with',
+  'insert',
+  'update',
+  'delete',
+  'show',
+  'describe',
+  'desc',
+  'explain',
+  'do',
+];
+
+/** A script statement that failed, with its 1-based position. */
+export class ScriptStatementError extends Error {
+  constructor(
+    readonly statement: number,
+    readonly total: number,
+    cause: unknown
+  ) {
+    super(
+      `Statement ${statement} of ${total} failed, so nothing was committed: ${cause instanceof Error ? cause.message : String(cause)}`
+    );
+  }
+}
+
+export interface ScriptStatementResult {
+  statement: number;
+  operation: string;
+  affectedRows: number | null;
+}
 
 interface ActiveTransaction {
   connection: DatabaseConnection;
@@ -129,22 +167,15 @@ export class TransactionManager {
       );
   }
 
-  async executeInTransaction(id: string, query: string): Promise<QueryResult> {
+  async executeInTransaction(
+    id: string,
+    query: string,
+    allowed: string[] = TRANSACTION_STATEMENTS
+  ): Promise<QueryResult> {
     const active = this.claim(id);
     try {
       await this.authorize(active, query);
-      // MySQL DDL commits implicitly; do not promise rollback for schema operations.
-      const error = validateStatement(query, [
-        'select',
-        'with',
-        'insert',
-        'update',
-        'delete',
-        'show',
-        'describe',
-        'desc',
-        'explain',
-      ]);
+      const error = validateStatement(query, allowed);
       if (error) throw new Error(error);
       const started = Date.now();
       const result = await this.read(active, query);
@@ -236,6 +267,53 @@ export class TransactionManager {
       throw error;
     } finally {
       this.transactions.delete(id);
+    }
+  }
+
+  /**
+   * Run statements in one transaction: all commit, or the first failure rolls
+   * every one back. Each is authorized and validated like
+   * `execute_in_transaction`, plus DDL where the database rolls it back.
+   */
+  async runScript(
+    connection: DatabaseConnection,
+    statements: string[]
+  ): Promise<ScriptStatementResult[]> {
+    const { transactionId } = await this.beginTransaction(connection);
+    const type = this.transactions.get(transactionId)!.type;
+    const allowed =
+      type === 'mysql'
+        ? TRANSACTION_STATEMENTS
+        : [...TRANSACTION_STATEMENTS, 'create', 'alter', 'drop'];
+    const results: ScriptStatementResult[] = [];
+    try {
+      for (const [index, statement] of statements.entries()) {
+        let result: QueryResult;
+        try {
+          const ddlError = scriptDdlError(statement);
+          if (ddlError) throw new Error(ddlError);
+          result = await this.executeInTransaction(transactionId, statement, allowed);
+        } catch (error) {
+          const ddl = type === 'mysql' && /^\s*(create|alter|drop)\b/i.test(statement);
+          throw new ScriptStatementError(
+            index + 1,
+            statements.length,
+            ddl ? new Error('MySQL commits DDL implicitly, so scripts cannot include it') : error
+          );
+        }
+        results.push({
+          statement: index + 1,
+          operation: statement.match(/^\s*([a-z]+)/i)?.[1].toLowerCase() ?? 'unknown',
+          // Sessions report affected rows as rowCount when nothing is returned.
+          affectedRows: result.affectedRows ?? (result.columns.length ? null : result.rowCount),
+        });
+      }
+      await this.commitTransaction(transactionId);
+      return results;
+    } finally {
+      // A failed statement already discarded it; anything else still open is rolled back.
+      if (this.transactions.has(transactionId))
+        await this.rollbackTransaction(transactionId).catch(() => {});
     }
   }
 

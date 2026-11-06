@@ -96,6 +96,58 @@ export function sqlTokens(query: string, dialect = 'generic'): SqlToken[] {
   return tokens;
 }
 
+/**
+ * Split a script into statements at top-level `;`, skipping quotes, comments
+ * and dollar-quoted bodies the way {@link sqlTokens} reads them. Each piece is
+ * still validated as a single statement afterwards, so a split that disagreed
+ * with the database would be rejected rather than run.
+ */
+export function splitSqlScript(script: string, dialect = 'generic'): string[] {
+  if (typeof script !== 'string' || !script.trim()) throw new Error('Script cannot be empty');
+  if (Buffer.byteLength(script) > 1_000_000) throw new Error('SQL exceeds the 1 MB limit');
+  const statements: string[] = [];
+  let start = 0;
+  let i = 0;
+  const push = (end: number) => {
+    const text = script.slice(start, end).trim();
+    // A piece of only comments is not a statement.
+    if (text && !/^(?:\s|--[^\n]*(?:\n|$)|\/\*[\s\S]*?\*\/)*$/.test(text)) statements.push(text);
+  };
+  while (i < script.length) {
+    const c = script[i];
+    if (script.startsWith('--', i)) {
+      const end = script.indexOf('\n', i);
+      i = end < 0 ? script.length : end;
+    } else if (script.startsWith('/*', i)) {
+      const end = script.indexOf('*/', i + 2);
+      if (end < 0) throw new Error('Unterminated SQL comment');
+      i = end + 2;
+    } else if (c === '$' && /^\$(?:[a-zA-Z_][a-zA-Z0-9_]*)?\$/.test(script.slice(i, i + 66))) {
+      const tag = script.slice(i).match(/^\$(?:[a-zA-Z_][a-zA-Z0-9_]*)?\$/)![0];
+      const end = script.indexOf(tag, i + tag.length);
+      if (end < 0) throw new Error('Unterminated SQL string');
+      i = end + tag.length;
+    } else if (["'", '"', '`'].includes(c) || (c === '[' && dialect === 'mssql')) {
+      const close = c === '[' ? ']' : c;
+      i++;
+      for (;;) {
+        if (i >= script.length) throw new Error('Unterminated SQL identifier or string');
+        if (script[i] === close) {
+          if (script[i + 1] === close) i += 2;
+          else break;
+        } else i++;
+      }
+      i++;
+    } else if (c === ';') {
+      push(i);
+      start = ++i;
+    } else i++;
+  }
+  push(script.length);
+  if (!statements.length) throw new Error('Script has no statements');
+  return statements;
+}
+
 export function validateStatement(
   query: string,
   expected?: string[],
@@ -119,6 +171,9 @@ export function validateStatement(
         'create',
         'alter',
         'drop',
+        // PostgreSQL anonymous code blocks; their body is a string hopsql
+        // cannot check, so AccessPolicy refuses them under access policies.
+        'do',
       ].includes(words[0])
     )
       return 'Unsupported SQL operation; use the dedicated transaction tools for transaction control';

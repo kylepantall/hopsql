@@ -306,6 +306,7 @@ Restrict which workspace connections are visible. Accepts connection IDs or disp
 ### Data Operations
 - `execute_query` - Run read-only queries (SELECT, EXPLAIN, SHOW, DESCRIBE only), inline or from a `file`
 - `write_query` - Run INSERT/UPDATE/DELETE, inline or from a `file`
+- `run_script` - Run a multi-statement script (a migration), inline or from a `file`, in one transaction: all statements commit or none do. `ask` connections approve the whole script once
 - `export_data` - Export to CSV/JSON, with optional gzip, Brotli, or zstd
 - `read_result` - Read a page of stored rows and columns
 - `read_result_cell` - Read a long cell in chunks
@@ -334,6 +335,8 @@ PostgreSQL, MySQL/MariaDB, and SQL Server support explicit transactions. Results
 - `execute_in_transaction` - Execute query within a transaction
 - `commit_transaction` - Commit a transaction
 - `rollback_transaction` - Roll back a transaction
+
+`run_script` uses the same transaction path. It adds DDL on tables, indexes, views, sequences and types where DDL rolls back (PostgreSQL, SQL Server; not MySQL/MariaDB). Functions, triggers, roles and extensions are refused, because they run or grant things the checks can't see. On `ask` connections the approval shows the whole script, never shortened; a script too long to show must be split into several calls. A wrapping `BEGIN`/`COMMIT` in the script is optional and dropped. Statements are split at top-level `;`, so procedural bodies must be dollar-quoted (`DO $$ ... $$`); MySQL `DELIMITER` and SQL Server `GO` are not supported. PostgreSQL `DO` blocks also work in `execute_in_transaction`. Their body can't be checked, so they are refused on connections with access policies.
 
 ### Query Analysis
 - `explain_query` - Analyze query execution plan

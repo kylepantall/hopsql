@@ -29,6 +29,9 @@ const missingTools = TOOLS.map((tool) => ({ ...tool, locate: () => null }));
 const byName = (reports: ReturnType<typeof diagnose>) =>
   Object.fromEntries(reports.map((r) => [r.name, r]));
 
+// runDoctor runs every real tool probe in turn (aws alone can take seconds on CI).
+const PROBE_ALL_TIMEOUT_MS = 30000;
+
 describe('hopsql doctor', () => {
   it('marks tools required only when a configured connection needs them', () => {
     const reports = byName(diagnose([sqlite, prod, shop], missingTools, 'darwin'));
@@ -73,39 +76,47 @@ describe('hopsql doctor', () => {
     expect(probe(path.join(dir, 'missing'), '--version')).toBeNull();
   });
 
-  it('never fails without --strict, and reports when configuration is missing', async () => {
-    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-    try {
-      expect(
-        await runDoctor(['--json'], async () => {
-          throw new Error('no config');
-        })
-      ).toBe(0);
-      const output = JSON.parse(String(stdout.mock.calls.at(-1)![0]));
-      expect(output.connectionsLoaded).toBe(false);
-      expect(output.tools.every((t: { required: boolean }) => !t.required)).toBe(true);
-      await expect(runDoctor(['--bogus'], async () => [])).rejects.toThrow();
-    } finally {
-      stdout.mockRestore();
-    }
-  });
+  it(
+    'never fails without --strict, and reports when configuration is missing',
+    async () => {
+      const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      try {
+        expect(
+          await runDoctor(['--json'], async () => {
+            throw new Error('no config');
+          })
+        ).toBe(0);
+        const output = JSON.parse(String(stdout.mock.calls.at(-1)![0]));
+        expect(output.connectionsLoaded).toBe(false);
+        expect(output.tools.every((t: { required: boolean }) => !t.required)).toBe(true);
+        await expect(runDoctor(['--bogus'], async () => [])).rejects.toThrow();
+      } finally {
+        stdout.mockRestore();
+      }
+    },
+    PROBE_ALL_TIMEOUT_MS
+  );
 
-  it('--strict exits non-zero only when a required tool is missing', async () => {
-    const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
-    try {
-      // duckdb is never installed in CI and nothing here needs it.
-      expect(await runDoctor(['--strict'], async () => [])).toBe(0);
-      const duck = connection('analytics', {
-        driver: 'duckdb',
-        properties: { database: ':memory:' },
-      });
-      const exit = await runDoctor(['--strict', '--json'], async () => [duck]);
-      const output = JSON.parse(String(stdout.mock.calls.at(-1)![0]));
-      const duckdb = output.tools.find((t: { name: string }) => t.name === 'duckdb');
-      expect(duckdb.required).toBe(true);
-      expect(exit).toBe(duckdb.found ? 0 : 1);
-    } finally {
-      stdout.mockRestore();
-    }
-  });
+  it(
+    '--strict exits non-zero only when a required tool is missing',
+    async () => {
+      const stdout = vi.spyOn(process.stdout, 'write').mockImplementation(() => true);
+      try {
+        // duckdb is never installed in CI and nothing here needs it.
+        expect(await runDoctor(['--strict'], async () => [])).toBe(0);
+        const duck = connection('analytics', {
+          driver: 'duckdb',
+          properties: { database: ':memory:' },
+        });
+        const exit = await runDoctor(['--strict', '--json'], async () => [duck]);
+        const output = JSON.parse(String(stdout.mock.calls.at(-1)![0]));
+        const duckdb = output.tools.find((t: { name: string }) => t.name === 'duckdb');
+        expect(duckdb.required).toBe(true);
+        expect(exit).toBe(duckdb.found ? 0 : 1);
+      } finally {
+        stdout.mockRestore();
+      }
+    },
+    PROBE_ALL_TIMEOUT_MS
+  );
 });
