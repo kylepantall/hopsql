@@ -1,6 +1,6 @@
 {
   "name": "hopsql",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "private": true,
   "description": "Database MCP server that reaches your DBeaver connections through SSH jump hosts and AWS SSM, with read-only policies and bounded results. A fork of omnisql-mcp.",
   "main": "dist/index.js",

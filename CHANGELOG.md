@@ -7,11 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.3.0] - 2026-11-06
+
 ### Added
 
+- `run_script` tool: runs a multi-statement script (inline or a `.sql` file) in one transaction, so all statements commit or none do. Each statement gets the same access checks as `execute_in_transaction`, and `ask` connections approve the whole script in one prompt. DDL is allowed where it rolls back (PostgreSQL, SQL Server).
 - VPN per connection: a `vpn` setting brings your VPN up before the connection dials, if its first host is unreachable, and takes it down when hopsql exits. Supports OpenVPN Connect profiles, or any client through `up`/`down`/`check` commands.
 - `hopsql vpn list | import <file.ovpn> | use <profile> <connection>... | clear <connection>...`: import OpenVPN Connect profiles and pick which connections need them.
 - `docker` VPN provider (`hopsql vpn use <profile|file.ovpn> <connection>... --docker`): runs OpenVPN in a local container and dials only hopsql's connections through its SOCKS proxy, so other apps stay off the VPN. `hopsql doctor` reports Docker when a connection needs it.
+
+### Fixed
+
+- PostgreSQL `DO` blocks were rejected as an unsupported operation. They now run in `execute_in_transaction` and `run_script`, except on connections with access policies, where their body can't be checked.
 
 ## [1.2.0] - 2026-11-02
 

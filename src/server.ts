@@ -88,6 +88,7 @@ import { ConnectionPoolManager } from './pools/index.js';
 import { sshTunnelManager, type HostKeyQuestion } from './net/ssh-tunnel.js';
 import { vpnManager } from './net/vpn.js';
 import { TransactionManager } from './managers/index.js';
+import { describeScriptForApproval, scriptStatements } from './runtime/script.js';
 import { buildExplainQuery, parseExplainOutput } from './utils/query-analyzer.js';
 import { compareSchemas, comparableSchema, generateMigrationScript } from './utils/schema-diff.js';
 import fs from 'fs';
@@ -112,6 +113,7 @@ const SQL_FILE_PROPERTY = {
 // Tool categories for filtering
 const WRITE_TOOLS = [
   'write_query',
+  'run_script',
   'create_table',
   'alter_table',
   'drop_table',
@@ -123,6 +125,7 @@ const WRITE_TOOLS = [
 
 const DATABASE_TOOLS = new Set([
   'write_query',
+  'run_script',
   'create_table',
   'alter_table',
   'drop_table',
@@ -691,6 +694,31 @@ export class HopsqlMCPServer {
               description: 'The SQL query to execute (INSERT, UPDATE, DELETE)',
             },
             file: SQL_FILE_PROPERTY,
+          },
+          required: ['connectionId'],
+        },
+      },
+      {
+        name: 'run_script',
+        description:
+          'Run a multi-statement SQL script (a migration) in one transaction: every statement commits, or the first failure rolls them all back. A leading BEGIN and trailing COMMIT are optional. Supports DML, PostgreSQL DO blocks, and DDL on PostgreSQL and SQL Server (MySQL commits DDL implicitly, so it is refused there). Each statement passes the same access checks as execute_in_transaction; ask connections approve the whole script once',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            connectionId: {
+              type: 'string',
+              description: 'The ID or name of the database connection to use',
+            },
+            database: {
+              type: 'string',
+              description: 'Database to run against, if not the connection default',
+            },
+            script: { type: 'string', description: 'The SQL script text' },
+            file: {
+              type: 'string',
+              description:
+                'Instead of script: absolute path to a local .sql/.psql/.pgsql/.mysql/.ddl/.dml file (max 1 MiB). Relative paths resolve against the server working directory',
+            },
           },
           required: ['connectionId'],
         },
@@ -1324,6 +1352,11 @@ export class HopsqlMCPServer {
               query: this.queryArgument(args),
             });
 
+          case 'run_script':
+            return await this.handleRunScript(
+              args as { connectionId: string; database?: string; script?: string; file?: string }
+            );
+
           case 'check_for_update':
             return this.toolResult(await getUpdateStatus(VERSION, { maxAgeMs: 60 * 60 * 1000 }));
 
@@ -1712,6 +1745,48 @@ export class HopsqlMCPServer {
         },
       ],
     };
+  }
+
+  private async handleRunScript(args: {
+    connectionId: string;
+    database?: string;
+    script?: string;
+    file?: string;
+  }) {
+    const connectionId = sanitizeConnectionId(args.connectionId);
+    let statements: string[];
+    let text: string;
+    try {
+      text = resolveQueryText({ query: args.script, file: args.file });
+      statements = scriptStatements(text);
+    } catch (error) {
+      throw new McpError(ErrorCode.InvalidParams, formatError(error));
+    }
+    const connection = await this.getConnection(connectionId, args.database);
+    if (!connection) {
+      throw new McpError(ErrorCode.InvalidParams, `Connection not found: ${connectionId}`);
+    }
+    this.assertNotReadOnly(connection);
+    if (connection.askBeforeWrite)
+      await this.askApproval(
+        connection,
+        describeScriptForApproval(statements, text, args.file),
+        `Run all ${statements.length} statements`
+      );
+    const started = Date.now();
+    let results;
+    try {
+      results = await this.transactionManager.runScript(connection, statements);
+    } catch (error) {
+      throw new McpError(ErrorCode.InvalidRequest, sanitizeDiagnostic(formatError(error)));
+    }
+    return this.toolResult({
+      connection: sanitizeDiagnostic(connection.name),
+      committed: true,
+      statements: results.length,
+      executionTime: Date.now() - started,
+      results,
+    });
   }
 
   private async handleCreateTable(args: {
@@ -2724,11 +2799,6 @@ export class HopsqlMCPServer {
   private async assertWritable(connection: DatabaseConnection, sql: string): Promise<void> {
     this.assertNotReadOnly(connection);
     if (!connection.askBeforeWrite) return;
-    if (!this.server.getClientCapabilities()?.elicitation)
-      throw new McpError(
-        ErrorCode.InvalidRequest,
-        'This connection asks before each write, and this client cannot ask the user'
-      );
     // The user must see exactly what runs: never truncate, and collapse
     // whitespace so padding cannot push part of the statement out of view.
     if (sql.length > 4000)
@@ -2736,13 +2806,26 @@ export class HopsqlMCPServer {
         ErrorCode.InvalidRequest,
         'Statement is too long to show for approval; split it into smaller statements'
       );
-    const shown = sql.replace(/\s+/g, ' ').trim();
+    await this.askApproval(connection, sql.replace(/\s+/g, ' ').trim(), 'Run this statement');
+  }
+
+  /** Ask the user in the client to approve a write on an `ask` connection. */
+  private async askApproval(
+    connection: DatabaseConnection,
+    shown: string,
+    label: string
+  ): Promise<void> {
+    if (!this.server.getClientCapabilities()?.elicitation)
+      throw new McpError(
+        ErrorCode.InvalidRequest,
+        'This connection asks before each write, and this client cannot ask the user'
+      );
     const result = await this.server.elicitInput(
       {
         message: `Hopsql: allow this write on "${connection.name}"?\n\n${shown}`,
         requestedSchema: {
           type: 'object',
-          properties: { approve: { type: 'boolean', title: 'Run this statement', default: false } },
+          properties: { approve: { type: 'boolean', title: label, default: false } },
           required: ['approve'],
         },
       },
