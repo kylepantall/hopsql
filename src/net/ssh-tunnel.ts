@@ -510,7 +510,7 @@ export class SshTunnelManager {
     if (!config?.enabled) {
       throw new Error(
         `Connection "${connection.name}" uses SSM in ssh mode, which carries an SSH tunnel; ` +
-          `enable the SSH tunnel in DBeaver or use ssm mode "port-forward".`
+          `enable the SSH tunnel in DBeaver (and drop any ssh override with enabled: false) or use ssm mode "port-forward".`
       );
     }
     // Built up front so a missing key or user on any hop fails before dialling.

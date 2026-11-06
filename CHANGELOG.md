@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `ssh` override: skip or replace a connection's DBeaver jump servers (`jumpHosts: []` or a new list), replace the final SSH host, or drop the tunnel (`enabled: false`), without editing DBeaver. Addresses and users only; auth still comes from DBeaver or the agent. Refused alongside a contradicting `ssm` setting.
+
 ## [1.3.0] - 2026-11-06
 
 ### Added

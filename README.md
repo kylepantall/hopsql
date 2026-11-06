@@ -413,6 +413,24 @@ forward, and the connection's host/port are treated the way DBeaver treats them:
 }
 ```
 
+- To skip or replace DBeaver's jump servers without editing DBeaver, add an `ssh` override (same
+  places as `ssm`, including the managed `~/.config/hopsql/overrides.json`). It holds addresses
+  and users only; authentication still comes from DBeaver or the SSH agent.
+
+| `ssh` override | Effect |
+| --- | --- |
+| `{ "jumpHosts": [] }` | Drop DBeaver's bastions; dial the final SSH host directly |
+| `{ "jumpHosts": [{ "host": "10.0.0.5", "port": 22, "user": "jump" }] }` | Replace the bastions, outermost first |
+| `{ "host": "app.example.com", "port": 22, "user": "ec2-user" }` | Replace the final SSH host (adds a tunnel to a direct connection) |
+| `{ "enabled": false }` | No tunnel; connect to the database host directly |
+| `{ "enabled": true }` | Turn on a tunnel DBeaver has switched off |
+
+  - The final host keeps DBeaver's auth. A replacement bastion keeps the auth of a DBeaver hop
+    with the same host, else uses the agent; its user defaults to the tunnel's.
+  - With `ssm` `mode: "ssh"` the session carries the first hop of the resulting route;
+    `enabled: false` is refused there. `ssm` `mode: "port-forward"` already skips SSH, so `ssh`
+    is refused with it. A `vpn` probes, or a docker VPN dials, the resulting first hop.
+
 - SSH host keys must match a trusted entry in `known_hosts`; unknown hosts are refused by default.
   Verify the host fingerprint through a trusted channel before adding it.
   `HOPSQL_SSH_STRICT_HOST_KEY=false` allows unknown hosts explicitly; known-host mismatches still fail.
