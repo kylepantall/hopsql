@@ -112,9 +112,32 @@ export interface AwsSecretConfig {
 export type WriteAccess = 'read-only' | 'ask' | 'writable';
 export const WRITE_ACCESS_MODES: readonly WriteAccess[] = ['read-only', 'ask', 'writable'];
 
+/**
+ * Changes to the SSH route DBeaver records, merged onto `sshTunnel`. Carries
+ * addresses and users only: authentication still comes from DBeaver or the
+ * SSH agent.
+ */
+export interface SshOverride {
+  /** `false` drops the tunnel and dials the database host directly. */
+  enabled?: boolean;
+  /** Replaces the final SSH host (the one that forwards to the database). */
+  host?: string;
+  port?: number;
+  user?: string;
+  /** Replaces DBeaver's bastions, outermost first; `[]` dials the final host directly. */
+  jumpHosts?: SshHopOverride[];
+}
+
+export interface SshHopOverride {
+  host: string;
+  port?: number;
+  user?: string;
+}
+
 /** Per-connection settings the config file layers onto discovered connections. */
 export interface ConnectionOverride {
   ssm?: SsmConfig;
+  ssh?: SshOverride;
   awsSecret?: AwsSecretConfig;
   vpn?: VpnConfig;
   /** Replaces the connection's own read-only flag. Older form of `access`. */

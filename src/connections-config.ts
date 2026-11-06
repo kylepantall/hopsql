@@ -3,6 +3,9 @@ import type {
   ConnectionOverride,
   DatabaseConnection,
   ManagedSettings,
+  SshHopOverride,
+  SshOverride,
+  SshTunnelConfig,
   SsmConfig,
   VpnConfig,
   WriteAccess,
@@ -101,6 +104,67 @@ export function parseSsm(value: unknown, label: string): SsmConfig {
     mode: ssm.mode,
     ...Object.fromEntries(optional.filter((k) => ssm[k] !== undefined).map((k) => [k, ssm[k]])),
   } as SsmConfig;
+}
+const SSH_HOST = /^[A-Za-z0-9][A-Za-z0-9._:[\]-]{0,253}$/;
+const SSH_USER = /^[A-Za-z0-9_][A-Za-z0-9_.@+-]{0,127}$/;
+function sshHop(hop: Record<string, unknown>, label: string): Partial<SshHopOverride> {
+  if (hop.host !== undefined && (typeof hop.host !== 'string' || !SSH_HOST.test(hop.host)))
+    throw new Error(`${label}.host must be a plain hostname or IP address`);
+  if (
+    hop.port !== undefined &&
+    (!Number.isInteger(hop.port) || (hop.port as number) < 1 || (hop.port as number) > 65535)
+  )
+    throw new Error(`${label}.port must be 1-65535`);
+  if (hop.user !== undefined && (typeof hop.user !== 'string' || !SSH_USER.test(hop.user)))
+    throw new Error(`${label}.user must be a plain SSH username`);
+  return Object.fromEntries(
+    ['host', 'port', 'user'].filter((k) => hop[k] !== undefined).map((k) => [k, hop[k]])
+  );
+}
+/**
+ * Validate an SSH route override. Addresses and users only: authentication
+ * stays with DBeaver or the agent, so no credential can be put here.
+ */
+export function parseSsh(value: unknown, label: string): SshOverride {
+  const ssh = object(value, `${label}: ssh`);
+  if (Object.keys(ssh).some((k) => !['enabled', 'host', 'port', 'user', 'jumpHosts'].includes(k)))
+    throw new Error(
+      `${label}: unknown ssh setting (authentication comes from DBeaver or the agent)`
+    );
+  if (Object.keys(ssh).length === 0) throw new Error(`${label}: ssh sets nothing`);
+  if (ssh.enabled !== undefined && typeof ssh.enabled !== 'boolean')
+    throw new Error(`${label}: ssh.enabled must be true or false`);
+  if (ssh.enabled === false && Object.keys(ssh).length > 1)
+    throw new Error(`${label}: ssh.enabled false drops the tunnel; remove the other ssh settings`);
+  const result: SshOverride = {
+    ...(ssh.enabled === undefined ? {} : { enabled: ssh.enabled }),
+    ...sshHop(ssh, `${label}: ssh`),
+  };
+  if (ssh.jumpHosts !== undefined) {
+    if (!Array.isArray(ssh.jumpHosts) || ssh.jumpHosts.length > 8)
+      throw new Error(`${label}: ssh.jumpHosts must be an array of at most 8 hosts`);
+    result.jumpHosts = ssh.jumpHosts.map((entry, i) => {
+      const hopLabel = `${label}: ssh.jumpHosts[${i}]`;
+      const hop = object(entry, hopLabel);
+      if (Object.keys(hop).some((k) => !['host', 'port', 'user'].includes(k)))
+        throw new Error(
+          `${hopLabel}: unknown setting (authentication comes from DBeaver or the agent)`
+        );
+      if (hop.host === undefined) throw new Error(`${hopLabel}.host is required`);
+      return sshHop(hop, hopLabel) as SshHopOverride;
+    });
+  }
+  return result;
+}
+/** Refuse an override whose SSM and SSH settings contradict each other. */
+function checkTransport(ssm: SsmConfig | undefined, ssh: SshOverride | undefined, label: string) {
+  if (!ssm || !ssh) return;
+  if (ssm.mode === 'port-forward')
+    throw new Error(`${label}: ssm mode "port-forward" replaces SSH; remove the ssh setting`);
+  if (ssh.enabled === false)
+    throw new Error(
+      `${label}: ssm mode "ssh" carries the SSH tunnel, so ssh.enabled cannot be false; use ssm mode "port-forward" to skip SSH`
+    );
 }
 /** Validate a Secrets Manager reference; the id is passed as one argv value. */
 export function parseAwsSecret(value: unknown, label: string): AwsSecretConfig {
@@ -252,7 +316,9 @@ export function loadConnectionOverrides(
   for (const [key, value] of Object.entries(overrides)) {
     const entry = object(value, `Override ${key}`);
     if (
-      Object.keys(entry).some((k) => !['ssm', 'awsSecret', 'vpn', 'readOnly', 'access'].includes(k))
+      Object.keys(entry).some(
+        (k) => !['ssm', 'ssh', 'awsSecret', 'vpn', 'readOnly', 'access'].includes(k)
+      )
     )
       // Kept strict: ignoring a setting could drop a restriction. Usually this is
       // a server older than the hopsql that wrote the file.
@@ -265,10 +331,14 @@ export function loadConnectionOverrides(
       throw new Error(`Override ${key}: access must be ${WRITE_ACCESS_MODES.join(', ')}`);
     if (entry.access !== undefined && entry.readOnly !== undefined)
       throw new Error(`Override ${key}: set access or readOnly, not both`);
+    const ssm = entry.ssm === undefined ? undefined : parseSsm(entry.ssm, `Override ${key}`);
+    const ssh = entry.ssh === undefined ? undefined : parseSsh(entry.ssh, `Override ${key}`);
+    checkTransport(ssm, ssh, `Override ${key}`);
     result[key] = {
       ...(entry.readOnly === undefined ? {} : { readOnly: entry.readOnly }),
       ...(entry.access === undefined ? {} : { access: entry.access as WriteAccess }),
-      ...(entry.ssm === undefined ? {} : { ssm: parseSsm(entry.ssm, `Override ${key}`) }),
+      ...(ssm ? { ssm } : {}),
+      ...(ssh ? { ssh } : {}),
       ...(entry.awsSecret === undefined
         ? {}
         : { awsSecret: parseAwsSecret(entry.awsSecret, `Override ${key}`) }),
@@ -373,6 +443,46 @@ export function overrideAccess(override: ConnectionOverride | undefined): WriteA
   return undefined;
 }
 
+const AUTH_FIELDS = ['authType', 'privateKeyPath', 'passphrase', 'password'] as const;
+/**
+ * Merge an SSH override onto DBeaver's tunnel. The final hop keeps DBeaver's
+ * authentication; a replacement bastion keeps the auth of the DBeaver hop with
+ * the same host, else uses the agent, and defaults to the tunnel's user.
+ */
+export function applySsh(
+  tunnel: SshTunnelConfig | undefined,
+  ssh: SshOverride
+): SshTunnelConfig | undefined {
+  if (ssh.enabled === false) return tunnel && { ...tunnel, enabled: false };
+  // Nothing to merge onto, and no host to build a tunnel from.
+  if (!tunnel && !ssh.host) return tunnel;
+  const base: SshTunnelConfig = tunnel ?? { enabled: true, host: ssh.host!, port: 22 };
+  const known = [...(base.jumpHosts ?? []), base];
+  const jumpHosts = ssh.jumpHosts?.map((hop): SshTunnelConfig => {
+    const match = known.find((k) => k.host === hop.host);
+    return {
+      ...(match
+        ? Object.fromEntries(
+            AUTH_FIELDS.filter((k) => match[k] !== undefined).map((k) => [k, match[k]])
+          )
+        : { authType: 'AGENT' }),
+      enabled: true,
+      host: hop.host,
+      port: hop.port ?? match?.port ?? 22,
+      user: hop.user ?? match?.user ?? ssh.user ?? base.user,
+      ...(base.connectTimeoutMs === undefined ? {} : { connectTimeoutMs: base.connectTimeoutMs }),
+    };
+  });
+  return {
+    ...base,
+    ...(ssh.enabled === undefined ? {} : { enabled: ssh.enabled }),
+    ...(ssh.host === undefined ? {} : { host: ssh.host }),
+    ...(ssh.port === undefined ? {} : { port: ssh.port }),
+    ...(ssh.user === undefined ? {} : { user: ssh.user }),
+    ...(jumpHosts ? { jumpHosts } : {}),
+  };
+}
+
 /**
  * Layer an override onto a connection; later settings win. `managed` marks the
  * `hopsql manage` file, whose access setting outranks HOPSQL_READ_ONLY=true.
@@ -387,6 +497,7 @@ export function applyOverride(
   return {
     ...connection,
     ...(override.ssm ? { ssm: override.ssm } : {}),
+    ...(override.ssh ? { sshTunnel: applySsh(connection.sshTunnel, override.ssh) } : {}),
     ...(override.awsSecret ? { awsSecret: override.awsSecret } : {}),
     ...(override.vpn ? { vpn: override.vpn } : {}),
     ...(access === undefined
