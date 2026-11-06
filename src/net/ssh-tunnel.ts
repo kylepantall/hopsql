@@ -33,6 +33,7 @@ import {
   startSsmSession,
   type SsmSession,
 } from './ssm.js';
+import { vpnManager } from './vpn.js';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 20000;
 
@@ -254,6 +255,7 @@ export class SshTunnelManager {
    */
   setDebug(debug: boolean): void {
     this.debug = debug;
+    vpnManager.setDebug(debug);
   }
 
   /** Set once the MCP client says it can ask the user; unset, unknown hosts are refused. */
@@ -323,6 +325,10 @@ export class SshTunnelManager {
     defaultPort: number
   ): Promise<TunnelEndpoint | null> {
     registerConnectionPrivacy(connection);
+    // Every path that dials a connection comes through here, tunneled or not.
+    // A live tunnel proves the VPN under it is still up.
+    if (connection.vpn && !this.tunnels.get(connection.id)?.alive)
+      await vpnManager.ensure(connection, defaultPort);
     const config = connection.sshTunnel;
     const ssm = connection.ssm;
     if (!ssm && (!config || !config.enabled)) {

@@ -10,6 +10,7 @@ import { spawn } from 'node:child_process';
 import type { Writable } from 'node:stream';
 import { askUser, type Approver } from './approval.js';
 import { sshTunnelManager } from './net/ssh-tunnel.js';
+import { vpnManager } from './net/vpn.js';
 import { dumpFlavorFor, resolveDumpTarget } from './runtime/dump.js';
 import type { DatabaseConnection, DumpFlavor, DumpTarget } from './types.js';
 
@@ -176,5 +177,6 @@ export async function runExec(
     });
   } finally {
     await sshTunnelManager.closeAll();
+    await vpnManager.disconnectAll();
   }
 }
