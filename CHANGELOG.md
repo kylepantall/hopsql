@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [1.4.1] - 2026-11-06
+
+### Fixed
+
+- Windows installer (and `hopsql update` on Windows) stopped after writing the launcher under Windows PowerShell 5.1, because `hopsql --version` prints on stderr. Claude registration and the tool check now run.
+
 ## [1.4.0] - 2026-11-06
 
 ### Added

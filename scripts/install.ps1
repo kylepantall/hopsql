@@ -42,6 +42,16 @@ function Invoke-Quiet([string]$What, [scriptblock]$Command) {
   }
 }
 
+# Output (stdout and stderr) of a native command that may write to stderr, such
+# as hopsql --version, without 5.1 turning that stderr into a terminating error.
+function Get-NativeOutput([scriptblock]$Command) {
+  $previous = $ErrorActionPreference
+  $ErrorActionPreference = 'Continue'
+  try {
+    & $Command 2>&1 | ForEach-Object { "$_" }
+  } finally { $ErrorActionPreference = $previous }
+}
+
 function Install-Hopsql {
   $repo = if ($env:HOPSQL_REPO) { $env:HOPSQL_REPO } else { 'kylepantall/hopsql' }
   if ($Help) {
@@ -193,7 +203,7 @@ function Install-Hopsql {
     )
     $oem = [System.Text.Encoding]::GetEncoding([System.Globalization.CultureInfo]::CurrentCulture.TextInfo.OEMCodePage)
     [IO.File]::WriteAllLines($launcher, [string[]]$lines, $oem)
-    $version = (& $launcher --version 2>&1 | ForEach-Object { "$_" }) -join ' '
+    $version = (Get-NativeOutput { & $launcher --version }) -join ' '
     Write-Info "$launcher (version $version)"
 
     if ($Claude) {
@@ -219,7 +229,7 @@ function Install-Hopsql {
     # Report only: missing database clients or the AWS CLI never fail the install.
     Write-Step 'Checking command-line tools'
     try {
-      & $launcher doctor 2>&1 | ForEach-Object { Write-Info "$_" }
+      Get-NativeOutput { & $launcher doctor } | ForEach-Object { Write-Info $_ }
     } catch {
       Write-Info 'Tool check skipped; run "hopsql doctor" later.'
     }
