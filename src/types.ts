@@ -40,7 +40,40 @@ export interface DatabaseConnection {
   ssm?: SsmConfig;
   /** Secrets Manager secret holding the username and password. */
   awsSecret?: AwsSecretConfig;
+  /** A VPN brought up before the connection is dialled. */
+  vpn?: VpnConfig;
 }
+
+/**
+ * A VPN the connection needs up. hopsql drives the user's own VPN client:
+ * `openvpn-connect` uses a profile imported into OpenVPN Connect, `command`
+ * runs argv the user supplies for any other client (never through a shell).
+ */
+export type VpnConfig = (
+  | { provider: 'openvpn-connect'; /** Profile id or name in OpenVPN Connect. */ profile: string }
+  | {
+      /**
+       * OpenVPN in a local Docker container: only hopsql's connections use it,
+       * through the container's SOCKS proxy. Set exactly one of `config` (an
+       * .ovpn file) or `profile` (an OpenVPN Connect profile id or name).
+       */
+      provider: 'docker';
+      config?: string;
+      profile?: string;
+    }
+  | {
+      provider: 'command';
+      up: string[];
+      down?: string[];
+      /** Exit status 0 means the VPN is up; replaces the reachability probe. */
+      check?: string[];
+    }
+) & {
+  /** How long to wait for the connection's first hop to become reachable. */
+  connectTimeoutMs?: number;
+  /** Take the VPN down when hopsql exits, if hopsql brought it up. Default true. */
+  disconnectOnExit?: boolean;
+};
 
 /**
  * An AWS Systems Manager Session Manager hop.
@@ -83,6 +116,7 @@ export const WRITE_ACCESS_MODES: readonly WriteAccess[] = ['read-only', 'ask', '
 export interface ConnectionOverride {
   ssm?: SsmConfig;
   awsSecret?: AwsSecretConfig;
+  vpn?: VpnConfig;
   /** Replaces the connection's own read-only flag. Older form of `access`. */
   readOnly?: boolean;
   /** Replaces the connection's own read-only flag; `ask` approves each write. */

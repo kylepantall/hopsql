@@ -418,6 +418,55 @@ forward, and the connection's host/port are treated the way DBeaver treats them:
 
 Table policies resolve real catalog names before checking access, including engine-specific case rules. Qualified denies also cover unqualified SQL; paged results and exports recheck permissions on every read. Restricted queries stay inside the selected database. See [access rules](docs/guides/access.md) for configuration and limits.
 
+### VPNs
+
+A connection can bring a VPN up before it dials, so you don't have to connect by hand. hopsql
+drives your own VPN client. It checks whether the connection's first host (the outermost SSH hop,
+else the database) accepts a TCP connection. If not, it starts the VPN and waits up to
+`connectTimeoutMs` (default 60s) for that host. A VPN hopsql started is taken down when hopsql
+exits (`disconnectOnExit: false` keeps it up).
+
+OpenVPN Connect (macOS, Windows):
+
+```bash
+hopsql vpn import ~/Downloads/work.ovpn --name Work   # once; save credentials in the app or use an autologin profile
+hopsql vpn use Work "Reporting (prod)" orders-db       # profile id or name, then connections
+hopsql vpn list                                        # profiles, and which connections use a VPN
+hopsql vpn clear orders-db
+```
+
+**Only hopsql through the VPN (Docker):** add `--docker` and the profile runs in a local
+container instead. Your Mac's routing is untouched, so the browser and other apps stay off the
+VPN. hopsql dials through the container's SOCKS proxy (published on loopback only), both for
+direct connections and for the first hop of an SSH tunnel. Needs Docker running. The image is
+built locally on first use from a digest-pinned Alpine base with `openvpn` and `dante`.
+Certificate-based profiles only (no password, SAML or MFA prompts). Not available with SSM.
+
+```bash
+hopsql vpn use Work orders-db --docker              # an imported OpenVPN Connect profile
+hopsql vpn use ~/vpn/work.ovpn orders-db --docker   # or any .ovpn file
+```
+
+Any other client: give the argv to bring it up and down (no shell), plus an optional `check`
+whose exit status 0 means "up". Set it under `overrides` or on a configured connection:
+
+```json
+"overrides": {
+  "orders-db": {
+    "vpn": { "provider": "command", "up": ["wg-quick", "up", "work"], "down": ["wg-quick", "down", "work"] }
+  }
+}
+```
+
+| ⚠️ Caveat | Why |
+|---|---|
+| The VPN is machine-wide (except `--docker`) | It changes routing for every app, not just hopsql |
+| The Docker proxy is reachable from your machine | Any local process can use `127.0.0.1:<port>` to reach the VPN while the container runs |
+| OpenVPN Connect holds one profile at a time | Connections that need different profiles will drop each other's VPN |
+| A database that's down looks like the VPN is down | hopsql starts the VPN, then times out with a message that says so |
+| Several hopsql servers share one VPN | The server that started it disconnects it when it exits |
+
+
 ### Querying another database on the same server
 
 Use `list_databases` with a saved `connectionId` to discover databases accessible on a PostgreSQL, MySQL/MariaDB, SQL Server, or ClickHouse instance. Pass an optional `database` to `execute_query`, `export_data`, `dump_table`, `dump_database`, `explain_query`, `list_tables`, `get_table_schema`, `get_database_stats`, `test_connection`, or `get_pool_stats`:

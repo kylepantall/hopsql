@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- VPN per connection: a `vpn` setting brings your VPN up before the connection dials, if its first host is unreachable, and takes it down when hopsql exits. Supports OpenVPN Connect profiles, or any client through `up`/`down`/`check` commands.
+- `hopsql vpn list | import <file.ovpn> | use <profile> <connection>... | clear <connection>...`: import OpenVPN Connect profiles and pick which connections need them.
+- `docker` VPN provider (`hopsql vpn use <profile|file.ovpn> <connection>... --docker`): runs OpenVPN in a local container and dials only hopsql's connections through its SOCKS proxy, so other apps stay off the VPN. `hopsql doctor` reports Docker when a connection needs it.
+
 ## [1.2.0] - 2026-11-02
 
 ### Added

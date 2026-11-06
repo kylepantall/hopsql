@@ -86,6 +86,7 @@ import {
 } from './utils.js';
 import { ConnectionPoolManager } from './pools/index.js';
 import { sshTunnelManager, type HostKeyQuestion } from './net/ssh-tunnel.js';
+import { vpnManager } from './net/vpn.js';
 import { TransactionManager } from './managers/index.js';
 import { buildExplainQuery, parseExplainOutput } from './utils/query-analyzer.js';
 import { compareSchemas, comparableSchema, generateMigrationScript } from './utils/schema-diff.js';
@@ -425,6 +426,8 @@ export class HopsqlMCPServer {
       } catch (error) {
         this.log(`Error closing SSH tunnels during shutdown: ${formatError(error)}`, 'error');
       }
+      // Last: the tunnels above may have run through it. Recycling keeps it up.
+      await vpnManager.disconnectAll();
       if (this.staleCleanupInterval) {
         clearInterval(this.staleCleanupInterval);
       }

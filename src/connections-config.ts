@@ -4,6 +4,7 @@ import type {
   DatabaseConnection,
   ManagedSettings,
   SsmConfig,
+  VpnConfig,
   WriteAccess,
 } from './types.js';
 import { WRITE_ACCESS_MODES } from './types.js';
@@ -28,6 +29,7 @@ const KEYS = [
   'passwordEnv', // Environment variable reference, never a literal credential.
   'ssm',
   'awsSecret',
+  'vpn',
 ];
 const LIMITS: Record<string, [number, number]> = {
   maxRows: [1, 100000],
@@ -118,6 +120,93 @@ export function parseAwsSecret(value: unknown, label: string): AwsSecretConfig {
     ...(secret.profile === undefined ? {} : { profile: secret.profile as string }),
   };
 }
+function argv(value: unknown, label: string): string[] {
+  if (
+    !Array.isArray(value) ||
+    value.length === 0 ||
+    value.length > 64 ||
+    value.some((part) => typeof part !== 'string' || part.length > 4096 || part.includes('\0')) ||
+    !value[0]
+  )
+    throw new Error(`${label} must be a non-empty array of strings: [program, ...arguments]`);
+  return [...value];
+}
+/**
+ * Validate a VPN requirement. Command argv runs without a shell; the
+ * OpenVPN Connect profile becomes one `--connect-shortcut` value, so it is a
+ * name or id, never an option.
+ */
+export function parseVpn(value: unknown, label: string): VpnConfig {
+  const vpn = object(value, `${label}: vpn`);
+  const shared = ['provider', 'connectTimeoutMs', 'disconnectOnExit'];
+  const own =
+    vpn.provider === 'openvpn-connect'
+      ? ['profile']
+      : vpn.provider === 'docker'
+        ? ['config', 'profile']
+        : vpn.provider === 'command'
+          ? ['up', 'down', 'check']
+          : undefined;
+  if (!own)
+    throw new Error(`${label}: vpn.provider must be "openvpn-connect", "docker" or "command"`);
+  if (Object.keys(vpn).some((k) => !shared.includes(k) && !own.includes(k)))
+    throw new Error(`${label}: unknown vpn setting`);
+  if (
+    vpn.connectTimeoutMs !== undefined &&
+    (!Number.isInteger(vpn.connectTimeoutMs) ||
+      (vpn.connectTimeoutMs as number) < 1000 ||
+      (vpn.connectTimeoutMs as number) > 600000)
+  )
+    throw new Error(`${label}: vpn.connectTimeoutMs must be 1000-600000`);
+  if (vpn.disconnectOnExit !== undefined && typeof vpn.disconnectOnExit !== 'boolean')
+    throw new Error(`${label}: vpn.disconnectOnExit must be true or false`);
+  const common = {
+    ...(vpn.connectTimeoutMs === undefined
+      ? {}
+      : { connectTimeoutMs: vpn.connectTimeoutMs as number }),
+    ...(vpn.disconnectOnExit === undefined
+      ? {}
+      : { disconnectOnExit: vpn.disconnectOnExit as boolean }),
+  };
+  const profileName = (value: unknown): value is string =>
+    typeof value === 'string' &&
+    Boolean(value.trim()) &&
+    value.length <= 512 &&
+    !value.startsWith('-') &&
+    !/[\0\r\n]/.test(value);
+  if (vpn.provider === 'openvpn-connect') {
+    if (!profileName(vpn.profile))
+      throw new Error(`${label}: vpn.profile must be an OpenVPN Connect profile name or id`);
+    return { provider: 'openvpn-connect', profile: vpn.profile, ...common };
+  }
+  if (vpn.provider === 'docker') {
+    if ((vpn.config === undefined) === (vpn.profile === undefined))
+      throw new Error(`${label}: set exactly one of vpn.config or vpn.profile`);
+    if (vpn.profile !== undefined && !profileName(vpn.profile))
+      throw new Error(`${label}: vpn.profile must be an OpenVPN Connect profile name or id`);
+    if (
+      vpn.config !== undefined &&
+      (typeof vpn.config !== 'string' ||
+        !(isAbsolute(vpn.config) || vpn.config.startsWith('~/')) ||
+        // Becomes the source of a docker --mount spec, which ',' would split.
+        /[\0\r\n,]/.test(vpn.config))
+    )
+      throw new Error(`${label}: vpn.config must be an absolute path to an .ovpn file`);
+    return {
+      provider: 'docker',
+      ...(vpn.config === undefined ? {} : { config: vpn.config as string }),
+      ...(vpn.profile === undefined ? {} : { profile: vpn.profile as string }),
+      ...common,
+    };
+  }
+  return {
+    provider: 'command',
+    up: argv(vpn.up, `${label}: vpn.up`),
+    ...(vpn.down === undefined ? {} : { down: argv(vpn.down, `${label}: vpn.down`) }),
+    ...(vpn.check === undefined ? {} : { check: argv(vpn.check, `${label}: vpn.check`) }),
+    ...common,
+  };
+}
 function env(name: unknown): string | undefined {
   if (name === undefined) return;
   if (typeof name !== 'string' || !/^[A-Za-z_][A-Za-z0-9_]*$/.test(name))
@@ -162,7 +251,9 @@ export function loadConnectionOverrides(
   const result: Record<string, ConnectionOverride> = {};
   for (const [key, value] of Object.entries(overrides)) {
     const entry = object(value, `Override ${key}`);
-    if (Object.keys(entry).some((k) => !['ssm', 'awsSecret', 'readOnly', 'access'].includes(k)))
+    if (
+      Object.keys(entry).some((k) => !['ssm', 'awsSecret', 'vpn', 'readOnly', 'access'].includes(k))
+    )
       // Kept strict: ignoring a setting could drop a restriction. Usually this is
       // a server older than the hopsql that wrote the file.
       throw new Error(
@@ -181,6 +272,7 @@ export function loadConnectionOverrides(
       ...(entry.awsSecret === undefined
         ? {}
         : { awsSecret: parseAwsSecret(entry.awsSecret, `Override ${key}`) }),
+      ...(entry.vpn === undefined ? {} : { vpn: parseVpn(entry.vpn, `Override ${key}`) }),
     };
   }
   return result;
@@ -296,6 +388,7 @@ export function applyOverride(
     ...connection,
     ...(override.ssm ? { ssm: override.ssm } : {}),
     ...(override.awsSecret ? { awsSecret: override.awsSecret } : {}),
+    ...(override.vpn ? { vpn: override.vpn } : {}),
     ...(access === undefined
       ? {}
       : {
@@ -414,6 +507,7 @@ export function loadConfiguredConnections(
       ...(entry.awsSecret === undefined
         ? {}
         : { awsSecret: parseAwsSecret(entry.awsSecret, `Connection ${id}`) }),
+      ...(entry.vpn === undefined ? {} : { vpn: parseVpn(entry.vpn, `Connection ${id}`) }),
     };
   });
 }

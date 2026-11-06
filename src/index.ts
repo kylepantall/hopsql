@@ -46,9 +46,15 @@ if (process.argv[2] === 'install') {
   process.exit(0);
 }
 
-if (['update', 'query', 'exec', 'access', 'doctor', 'refresh'].includes(process.argv[2])) {
+if (['update', 'query', 'exec', 'access', 'doctor', 'refresh', 'vpn'].includes(process.argv[2])) {
   const args = process.argv.slice(3);
   try {
+    if (process.argv[2] === 'vpn') {
+      const { runVpnCommand } = await import('./vpn-cli.js');
+      const { loadConnections } = await import('./manage.js');
+      await runVpnCommand(args, loadConnections);
+      process.exit(0);
+    }
     if (process.argv[2] === 'refresh') {
       const { runRefresh } = await import('./refresh.js');
       await runRefresh(args);
@@ -77,7 +83,10 @@ if (['update', 'query', 'exec', 'access', 'doctor', 'refresh'].includes(process.
     }
     const { parseQueryArgs } = await import('./query-cli.js');
     const { tool, args: toolArgs } = parseQueryArgs(args);
-    const result = await server.callTool(tool, toolArgs);
+    const result = await server.callTool(tool, toolArgs).finally(async () => {
+      const { vpnManager } = await import('./net/vpn.js');
+      await vpnManager.disconnectAll();
+    });
     process.stdout.write(result.content[0].text + '\n');
     process.exit(0);
   } catch (error) {
@@ -102,6 +111,8 @@ Usage: hopsql                 Manage connections (in a terminal; MCP clients get
        hopsql query <connection> (<sql> | --file <query.sql>) [--write] [--database <name>] [--max-rows <n>]
        hopsql exec <connection> [--database <name>] -- <command> [args...]
                               Run a tool (psql, mysql, migrations) with the connection's credentials in its env
+       hopsql vpn [list | import <file.ovpn> [--name <name>] | use <profile> <connection>... [--docker] | clear <connection>...]
+                              Bring a VPN up automatically for connections that need it; --docker keeps it to hopsql
        hopsql update [--check] [--yes] [--json]
                               Install the latest GitHub release
 
@@ -131,6 +142,8 @@ Environment Variables:
   HOPSQL_DISABLED_TOOLS       Comma-separated list of tools to disable
   HOPSQL_SSH_KNOWN_HOSTS      known_hosts used to verify SSH tunnel hosts (default: ~/.ssh/known_hosts)
   HOPSQL_SSH_STRICT_HOST_KEY  Refuse SSH tunnel hosts with no known_hosts entry (default: true)
+  HOPSQL_OPENVPN_CONNECT      Path to the OpenVPN Connect executable, if not installed in the default place
+  HOPSQL_DOCKER_PATH          Path to the docker CLI, for VPNs run in a container
 
 Features:
   - Direct database instances with independent permissions; optional saved-workspace import
