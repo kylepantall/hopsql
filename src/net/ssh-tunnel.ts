@@ -334,7 +334,7 @@ export class SshTunnelManager {
   ): Promise<TunnelEndpoint | null> {
     registerConnectionPrivacy(connection);
     // Every path that dials a connection comes through here, tunneled or not.
-    // A docker VPN is dialled through its proxy; for a host VPN, a live tunnel
+    // A docker or vpnhop VPN is dialled through its proxy; for a host VPN, a live tunnel
     // proves the VPN under it is still up.
     let proxy: SocksProxy | undefined;
     if (usesVpnProxy(connection)) proxy = await vpnManager.proxyFor(connection);
@@ -384,7 +384,11 @@ export class SshTunnelManager {
     })();
     this.pending.set(key, creation);
     try {
-      const tunnel = await creation;
+      const tunnel = await creation.catch((error: unknown) => {
+        // A dead vpnhop proxy (tunnel restarted elsewhere) is asked for again next time.
+        if (proxy) vpnManager.forgetProxy(connection);
+        throw error;
+      });
       tunnel.via = via;
       tunnel.generation = (this.generations.get(key) ?? 0) + 1;
       this.generations.set(key, tunnel.generation);
@@ -398,7 +402,7 @@ export class SshTunnelManager {
 
   /**
    * A loopback listener whose connections are carried to the database by a
-   * docker VPN's SOCKS proxy, for connections with no SSH tunnel.
+   * docker or vpnhop VPN's SOCKS proxy, for connections with no SSH tunnel.
    */
   private async openSocksForward(
     connection: DatabaseConnection,
@@ -426,6 +430,7 @@ export class SshTunnelManager {
         },
         (error: Error) => {
           this.log(`VPN forward to ${destHost}:${destPort} failed: ${error.message}`);
+          vpnManager.forgetProxy(connection);
           socket.destroy();
         }
       );
@@ -557,7 +562,7 @@ export class SshTunnelManager {
           );
           sock = childStream(session.child);
         } else if (proxy) {
-          // The first hop is reached through the docker VPN's proxy.
+          // The first hop is reached through the docker or vpnhop VPN's proxy.
           sock = await socksConnect(
             proxy,
             hop.host,

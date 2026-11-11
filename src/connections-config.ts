@@ -16,6 +16,7 @@ import fs from 'node:fs';
 import { homedir } from 'node:os';
 import { dirname, isAbsolute, join } from 'node:path';
 import { readPrivateFile } from './runtime/private-file.js';
+import { VPNHOP_PROFILE_NAME } from './net/vpnhop.js';
 
 const KEYS = [
   'name',
@@ -202,17 +203,25 @@ function argv(value: unknown, label: string): string[] {
  */
 export function parseVpn(value: unknown, label: string): VpnConfig {
   const vpn = object(value, `${label}: vpn`);
-  const shared = ['provider', 'connectTimeoutMs', 'disconnectOnExit'];
+  // hopsql never stops a vpnhop tunnel, so disconnectOnExit has no meaning there.
+  const shared =
+    vpn.provider === 'vpnhop'
+      ? ['provider', 'connectTimeoutMs']
+      : ['provider', 'connectTimeoutMs', 'disconnectOnExit'];
   const own =
     vpn.provider === 'openvpn-connect'
       ? ['profile']
       : vpn.provider === 'docker'
         ? ['config', 'profile']
-        : vpn.provider === 'command'
-          ? ['up', 'down', 'check']
-          : undefined;
+        : vpn.provider === 'vpnhop'
+          ? ['profile']
+          : vpn.provider === 'command'
+            ? ['up', 'down', 'check']
+            : undefined;
   if (!own)
-    throw new Error(`${label}: vpn.provider must be "openvpn-connect", "docker" or "command"`);
+    throw new Error(
+      `${label}: vpn.provider must be "openvpn-connect", "docker", "vpnhop" or "command"`
+    );
   if (Object.keys(vpn).some((k) => !shared.includes(k) && !own.includes(k)))
     throw new Error(`${label}: unknown vpn setting`);
   if (
@@ -242,6 +251,11 @@ export function parseVpn(value: unknown, label: string): VpnConfig {
     if (!profileName(vpn.profile))
       throw new Error(`${label}: vpn.profile must be an OpenVPN Connect profile name or id`);
     return { provider: 'openvpn-connect', profile: vpn.profile, ...common };
+  }
+  if (vpn.provider === 'vpnhop') {
+    if (typeof vpn.profile !== 'string' || !VPNHOP_PROFILE_NAME.test(vpn.profile))
+      throw new Error(`${label}: vpn.profile must be a vpnhop profile name`);
+    return { provider: 'vpnhop', profile: vpn.profile, ...common };
   }
   if (vpn.provider === 'docker') {
     if ((vpn.config === undefined) === (vpn.profile === undefined))

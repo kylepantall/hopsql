@@ -111,7 +111,7 @@ Usage: hopsql                 Manage connections (in a terminal; MCP clients get
        hopsql query <connection> (<sql> | --file <query.sql>) [--write] [--database <name>] [--max-rows <n>]
        hopsql exec <connection> [--database <name>] -- <command> [args...]
                               Run a tool (psql, mysql, migrations) with the connection's credentials in its env
-       hopsql vpn [list | import <file.ovpn> [--name <name>] | use <profile> <connection>... [--docker] | clear <connection>...]
+       hopsql vpn [list | import <file.ovpn> [--name <name>] | use <profile> <connection>... [--docker | --vpnhop] | clear <connection>...]
                               Bring a VPN up automatically for connections that need it; --docker keeps it to hopsql
        hopsql update [--check] [--yes] [--json]
                               Install the latest GitHub release

@@ -62,6 +62,15 @@ export type VpnConfig = (
       profile?: string;
     }
   | {
+      /**
+       * A vpnhop profile: vpnhop runs the tunnel and returns a loopback SOCKS
+       * proxy (`vpnhop proxy <profile> --json`) that hopsql dials through, as
+       * with `docker`. hopsql never stops vpnhop tunnels; their lease expires.
+       */
+      provider: 'vpnhop';
+      profile: string;
+    }
+  | {
       provider: 'command';
       up: string[];
       down?: string[];
@@ -71,7 +80,7 @@ export type VpnConfig = (
 ) & {
   /** How long to wait for the connection's first hop to become reachable. */
   connectTimeoutMs?: number;
-  /** Take the VPN down when hopsql exits, if hopsql brought it up. Default true. */
+  /** Take the VPN down when hopsql exits, if hopsql brought it up. Default true. Not for vpnhop. */
   disconnectOnExit?: boolean;
 };
 

@@ -429,7 +429,7 @@ forward, and the connection's host/port are treated the way DBeaver treats them:
     with the same host, else uses the agent; its user defaults to the tunnel's.
   - With `ssm` `mode: "ssh"` the session carries the first hop of the resulting route;
     `enabled: false` is refused there. `ssm` `mode: "port-forward"` already skips SSH, so `ssh`
-    is refused with it. A `vpn` probes, or a docker VPN dials, the resulting first hop.
+    is refused with it. A `vpn` probes, or a docker or vpnhop VPN dials, the resulting first hop.
 
 - SSH host keys must match a trusted entry in `known_hosts`; unknown hosts are refused by default.
   Verify the host fingerprint through a trusted channel before adding it.
@@ -468,6 +468,19 @@ hopsql vpn use Work orders-db --docker              # an imported OpenVPN Connec
 hopsql vpn use ~/vpn/work.ovpn orders-db --docker   # or any .ovpn file
 ```
 
+**vpnhop profiles:** add `--vpnhop` to use a [vpnhop](https://github.com/kylepantall/vpnhop)
+profile (vpnhop 0.2.0+). vpnhop runs the tunnel and its credentials; hopsql calls
+`vpnhop proxy <profile> --json` and dials through the SOCKS proxy it returns, the same way as
+`--docker`. The first call may wait for Touch ID and the VPN connect, up to `connectTimeoutMs`
+(default 90s). hopsql never stops vpnhop tunnels; vpnhop stops one when its lease runs out.
+Not available with SSM. hopsql finds vpnhop via `$VPNHOP_BIN`, then `~/.local/bin/vpnhop`,
+then `PATH`.
+
+```bash
+hopsql vpn use aws orders-db --vpnhop   # writes "vpn": { "provider": "vpnhop", "profile": "aws" }
+hopsql vpn list                         # includes vpnhop profiles and their state
+```
+
 Any other client: give the argv to bring it up and down (no shell), plus an optional `check`
 whose exit status 0 means "up". Set it under `overrides` or on a configured connection:
 
@@ -481,8 +494,8 @@ whose exit status 0 means "up". Set it under `overrides` or on a configured conn
 
 | ⚠️ Caveat | Why |
 |---|---|
-| The VPN is machine-wide (except `--docker`) | It changes routing for every app, not just hopsql |
-| The Docker proxy is reachable from your machine | Any local process can use `127.0.0.1:<port>` to reach the VPN while the container runs |
+| The VPN is machine-wide (except `--docker` and `--vpnhop`) | It changes routing for every app, not just hopsql |
+| The Docker or vpnhop proxy is reachable from your machine | Any local process can use `127.0.0.1:<port>` to reach the VPN while the tunnel runs |
 | OpenVPN Connect holds one profile at a time | Connections that need different profiles will drop each other's VPN |
 | A database that's down looks like the VPN is down | hopsql starts the VPN, then times out with a message that says so |
 | Several hopsql servers share one VPN | The server that started it disconnects it when it exits |

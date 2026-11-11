@@ -11,6 +11,7 @@ import { isIamAuthConnection, awsCliPath } from './auth/iam-auth.js';
 import { clientInvocation } from './install.js';
 import { resolveWindowsCommand } from './net/ssm.js';
 import { dockerPath } from './net/vpn-docker.js';
+import { vpnhopPath } from './net/vpnhop.js';
 import { sqlDialect } from './policy/analyzer.js';
 import {
   dumpFlavorFor,
@@ -138,6 +139,16 @@ export const TOOLS: ToolSpec[] = [
       'see https://docs.docker.com/engine/install/',
       'winget install Docker.DockerDesktop'
     ),
+  },
+  {
+    name: 'vpnhop',
+    feature: 'VPNs run by vpnhop (vpn provider "vpnhop")',
+    locate: () => probe(vpnhopPath(), '--version'),
+    needs: (c) => c.vpn?.provider === 'vpnhop',
+    hint: (platform) =>
+      platform === 'win32'
+        ? 'see https://github.com/kylepantall/vpnhop'
+        : 'curl -fsSL https://raw.githubusercontent.com/kylepantall/vpnhop/main/scripts/install.sh | bash, or set VPNHOP_BIN',
   },
   {
     name: 'session-manager-plugin',
