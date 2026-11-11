@@ -24,6 +24,7 @@ import { registerPrivateValue, sanitizeDiagnostic } from '../privacy.js';
 import type { DatabaseConnection, VpnConfig } from '../types.js';
 import { socksAvailable, type SocksProxy } from './socks.js';
 import { containerName, DockerVpn } from './vpn-docker.js';
+import { VPNHOP_CONNECT_TIMEOUT_MS, vpnhopProxy } from './vpnhop.js';
 
 const DEFAULT_CONNECT_TIMEOUT_MS = 60000;
 const DOCKER_CONNECT_TIMEOUT_MS = 120000;
@@ -280,8 +281,10 @@ export async function importOpenVpnProfile(
 
 // --- Manager -----------------------------------------------------------------
 
-type HostVpn = Exclude<VpnConfig, { provider: 'docker' }>;
+type ProxyVpn = Extract<VpnConfig, { provider: 'docker' | 'vpnhop' }>;
+type HostVpn = Exclude<VpnConfig, ProxyVpn>;
 type DockerVpnConfig = Extract<VpnConfig, { provider: 'docker' }>;
+type VpnhopVpnConfig = Extract<VpnConfig, { provider: 'vpnhop' }>;
 
 function vpnKey(vpn: HostVpn): string {
   return vpn.provider === 'openvpn-connect'
@@ -295,13 +298,18 @@ function describe(vpn: HostVpn): string {
     : `VPN command "${vpn.up[0]}"`;
 }
 
+function vpnhopKey(profile: string): string {
+  return `vpnhop:${profile}`;
+}
+
 function expandHome(file: string): string {
   return file.startsWith('~/') ? path.join(os.homedir(), file.slice(2)) : file;
 }
 
-/** True for a VPN only hopsql's connections use, dialled through its SOCKS proxy. */
+/** True for a VPN dialled through a SOCKS proxy (docker or vpnhop), not machine-wide. */
 export function usesVpnProxy(connection: DatabaseConnection): boolean {
-  return connection.vpn?.provider === 'docker';
+  const provider = connection.vpn?.provider;
+  return provider === 'docker' || provider === 'vpnhop';
 }
 
 export interface VpnManagerOptions {
@@ -357,7 +365,8 @@ export class VpnManager {
   async ensure(connection: DatabaseConnection, defaultPort: number): Promise<void> {
     const vpn = connection.vpn;
     if (!vpn) return;
-    if (vpn.provider === 'docker') return void (await this.proxyFor(connection));
+    if (vpn.provider === 'docker' || vpn.provider === 'vpnhop')
+      return void (await this.proxyFor(connection));
     if (vpn.provider === 'openvpn-connect') registerPrivateValue(vpn.profile);
     const key = vpnKey(vpn);
     if ((this.upUntil.get(key) ?? 0) > this.now()) return;
@@ -445,17 +454,20 @@ export class VpnManager {
   }
 
   /**
-   * The SOCKS proxy of the connection's VPN container, starting the container
-   * if it is not running. A container another server started for the same
-   * profile is reused, and left running on exit.
+   * The SOCKS proxy the connection dials through. For docker, the VPN
+   * container's, starting the container if it is not running; a container
+   * another server started for the same profile is reused, and left running on
+   * exit. For vpnhop, the one `vpnhop proxy` returns.
    */
   async proxyFor(connection: DatabaseConnection): Promise<SocksProxy> {
     const vpn = connection.vpn;
-    if (vpn?.provider !== 'docker') throw new Error('Connection has no docker VPN');
+    if (vpn?.provider !== 'docker' && vpn?.provider !== 'vpnhop')
+      throw new Error('Connection has no proxy VPN');
     if (connection.ssm)
       throw new Error(
-        `Connection "${connection.name}" uses SSM, which reaches AWS directly; a docker VPN cannot carry it`
+        `Connection "${connection.name}" uses SSM, which reaches AWS directly; a ${vpn.provider} VPN cannot carry it`
       );
+    if (vpn.provider === 'vpnhop') return this.vpnhopProxyFor(vpn);
     const file = await this.dockerProfileFile(vpn);
     const name = containerName(file);
     const cached = this.proxies.get(name);
@@ -467,6 +479,43 @@ export class VpnManager {
     );
     this.pendingProxies.set(name, work);
     return work;
+  }
+
+  /**
+   * Cached like a container's proxy, but never past the lease vpnhop gave:
+   * asking again extends it. hopsql never stops vpnhop tunnels.
+   */
+  private async vpnhopProxyFor(vpn: VpnhopVpnConfig): Promise<SocksProxy> {
+    registerPrivateValue(vpn.profile);
+    const key = vpnhopKey(vpn.profile);
+    const cached = this.proxies.get(key);
+    if (cached && cached.checkedUntil > this.now()) return cached.proxy;
+    const inFlight = this.pendingProxies.get(key);
+    if (inFlight) return inFlight;
+    const work = (async () => {
+      this.log('requesting vpnhop proxy', {});
+      const { expiresAt, ...proxy } = await vpnhopProxy(
+        vpn.profile,
+        vpn.connectTimeoutMs ?? VPNHOP_CONNECT_TIMEOUT_MS,
+        this.runner
+      );
+      this.proxies.set(key, {
+        proxy,
+        checkedUntil: Math.min(this.now() + UP_CACHE_MS, expiresAt),
+      });
+      return proxy;
+    })().finally(() => this.pendingProxies.delete(key));
+    this.pendingProxies.set(key, work);
+    return work;
+  }
+
+  /**
+   * Forget a vpnhop connection's cached proxy after a dial through it failed,
+   * so the next dial asks vpnhop again (it may have restarted the tunnel).
+   */
+  forgetProxy(connection: DatabaseConnection): void {
+    if (connection.vpn?.provider === 'vpnhop')
+      this.proxies.delete(vpnhopKey(connection.vpn.profile));
   }
 
   private async startContainer(

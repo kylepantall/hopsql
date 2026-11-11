@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- `vpnhop` VPN provider (`"vpn": { "provider": "vpnhop", "profile": "aws" }`, or `hopsql vpn use <profile> <connection>... --vpnhop`): dials direct connections and the first SSH hop through the SOCKS proxy `vpnhop proxy <profile> --json` returns, like `docker`. The proxy is cached briefly and never past its lease (`expiresAt`); a failed dial asks vpnhop again. hopsql never stops vpnhop tunnels. Not available with SSM. Needs vpnhop 0.2.0+.
+- `hopsql vpn list` also lists vpnhop profiles (`vpnhop list --json`). `hopsql doctor` reports vpnhop when a connection needs it.
+
 ## [1.4.1] - 2026-11-06
 
 ### Fixed
