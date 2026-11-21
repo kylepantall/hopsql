@@ -14,8 +14,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22.x'
       - uses: oven-sh/setup-bun@v2
@@ -42,7 +42,7 @@ jobs:
         run: bun scripts/check-package.mjs && node scripts/check-package.mjs
       - run: bun audit --audit-level=high
       - run: bash -n scripts/install.sh && bash scripts/install.sh --help
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: compiled-server
           path: dist/
@@ -53,15 +53,15 @@ jobs:
       matrix:
         version: [22.15.0, 22.x, 24.x, 26.x]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: ${{ matrix.version }}
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: '1.4.3'
       - run: bun install --production --frozen-lockfile --ignore-scripts
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v7
         with:
           name: compiled-server
           path: dist/
@@ -69,8 +69,8 @@ jobs:
   windows-installer:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22.x'
       - uses: oven-sh/setup-bun@v2
@@ -87,8 +87,8 @@ jobs:
         engine: [postgres, mysql, mariadb, mssql, oracle]
         runtime: [bun, node]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22.x'
       - uses: oven-sh/setup-bun@v2
@@ -100,7 +100,7 @@ jobs:
   rust:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@1.99.0
         with:
           targets: wasm32-unknown-unknown
@@ -116,7 +116,7 @@ jobs:
       - run: bun run build:rust
       - run: git diff --exit-code -- 'src/native/*.js' 'src/native/*.d.ts' src/native/package.json
       - run: bun test --isolate tests/access-policy.test.ts tests/security-policy.test.ts tests/connections-config.test.ts tests/policy-identifiers.test.ts
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v6
         with:
           name: rust-wasm-linux
           path: src/native/
@@ -126,8 +126,8 @@ jobs:
       matrix:
         runtime: [bun, node]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22.x'
       - uses: oven-sh/setup-bun@v2
@@ -153,8 +153,8 @@ jobs:
       matrix:
         runtime: [bun, node]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22.x'
       - uses: oven-sh/setup-bun@v2
@@ -171,8 +171,8 @@ jobs:
       matrix:
         runtime: [bun, node]
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+      - uses: actions/checkout@v5
+      - uses: actions/setup-node@v5
         with:
           node-version: '22.x'
       - uses: oven-sh/setup-bun@v2
